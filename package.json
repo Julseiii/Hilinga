@@ -1,0 +1,11 @@
+{
+  "name": "hilinga-app-workspace",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix Hilinga-app-prototype run dev",
+    "build": "npm --prefix Hilinga-app-prototype run build",
+    "lint": "npm --prefix Hilinga-app-prototype run lint",
+    "typecheck": "npm --prefix Hilinga-app-prototype run typecheck",
+    "preview": "npm --prefix Hilinga-app-prototype run preview"
+  }
+}

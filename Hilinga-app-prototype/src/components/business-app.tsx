@@ -1,0 +1,275 @@
+import { FormEvent, useEffect, useMemo, useState } from "react";
+
+import { useAuth } from "@/providers/auth-provider";
+import { BUSINESS_CONTENT_CHANGED_EVENT } from "@/lib/business-content";
+
+type BusinessTab = "home" | "my-business" | "create" | "inbox" | "profile";
+type BusinessPostCategory = "Photos & Videos" | "Events" | "Promotions";
+type BusinessItem = {
+  id: string;
+  category?: BusinessPostCategory;
+  kind?: string;
+  title: string;
+  detail: string;
+  imageUrl?: string;
+  mediaUrl?: string;
+  mediaType?: "image" | "video";
+  eventDate?: string;
+  eventLocation?: string;
+  promotionOffer?: string;
+  promotionEnds?: string;
+  createdAt: string;
+};
+type BusinessPageInfo = {
+  name: string;
+  businessScale: "Small business" | "Big enterprise";
+  category: string;
+  location: string;
+  phone: string;
+  email: string;
+  hours: string;
+  about: string;
+  coverUrl: string;
+  logoUrl: string;
+};
+
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const MAX_VIDEO_BYTES = 3 * 1024 * 1024;
+
+const tabs: { id: BusinessTab; label: string; icon: string }[] = [
+  { id: "home", label: "HOME", icon: "home" },
+  { id: "my-business", label: "MY BUSINESS", icon: "storefront" },
+  { id: "create", label: "Create", icon: "add" },
+  { id: "inbox", label: "INBOX", icon: "inbox" },
+  { id: "profile", label: "PROFILE", icon: "person" },
+];
+
+function Icon({ name, size = 24 }: { name: string; size?: number }) {
+  return <span className="material-symbols-outlined" style={{ fontSize: size }} aria-hidden="true">{name}</span>;
+}
+
+function EmptyBusinessState({ icon, title, body }: { icon: string; title: string; body: string }) {
+  return <div className="business-empty-state"><span><Icon name={icon} size={30} /></span><strong>{title}</strong><p>{body}</p></div>;
+}
+
+function resizeImage(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("That image could not be opened."));
+    reader.onload = () => {
+      const image = new Image();
+      image.onerror = () => reject(new Error("That image could not be opened."));
+      image.onload = () => {
+        const maxSide = 1200;
+        const scale = Math.min(1, maxSide / Math.max(image.width, image.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(image.width * scale));
+        canvas.height = Math.max(1, Math.round(image.height * scale));
+        canvas.getContext("2d")?.drawImage(image, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", 0.82));
+      };
+      image.src = String(reader.result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function readFileAsDataUrl(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("That file could not be opened."));
+    reader.onload = () => resolve(String(reader.result));
+    reader.readAsDataURL(file);
+  });
+}
+
+export function BusinessApp() {
+  const { profile, user, avatarUrl, signOut } = useAuth();
+  const [tab, setTab] = useState<BusinessTab>(() => {
+    const route = window.location.hash.replace("#business/", "") as BusinessTab;
+    return tabs.some((item) => item.id === route && route !== "create") ? route : "home";
+  });
+  const [createOpen, setCreateOpen] = useState(false);
+  const [category, setCategory] = useState<BusinessPostCategory>("Photos & Videos");
+  const [title, setTitle] = useState("");
+  const [detail, setDetail] = useState("");
+  const [mediaUrl, setMediaUrl] = useState("");
+  const [mediaType, setMediaType] = useState<"image" | "video">("image");
+  const [eventDate, setEventDate] = useState("");
+  const [eventLocation, setEventLocation] = useState("");
+  const [promotionOffer, setPromotionOffer] = useState("");
+  const [promotionEnds, setPromotionEnds] = useState("");
+  const [imageError, setImageError] = useState("");
+  const storageKey = `hilinga_business_items_v1:${user?.uid ?? "guest"}`;
+  const pageStorageKey = `hilinga_business_page_v1:${user?.uid ?? "guest"}`;
+  const [items, setItems] = useState<BusinessItem[]>(() => {
+    try { return JSON.parse(localStorage.getItem(storageKey) ?? "[]") as BusinessItem[]; } catch { return []; }
+  });
+  const defaultPageInfo: BusinessPageInfo = {
+    name: profile?.display_name?.trim() || "Your business",
+    businessScale: "Small business",
+    category: "Local Business",
+    location: "Legazpi City, Albay",
+    phone: "",
+    email: user?.email ?? "",
+    hours: "Open daily · 8:00 AM–6:00 PM",
+    about: "Tell customers what makes your business special, what you offer, and the story behind your brand.",
+    coverUrl: "",
+    logoUrl: avatarUrl ?? "",
+  };
+  const [pageInfo, setPageInfo] = useState<BusinessPageInfo>(() => {
+    try { return { ...defaultPageInfo, ...JSON.parse(localStorage.getItem(pageStorageKey) ?? "{}") as Partial<BusinessPageInfo> }; }
+    catch { return defaultPageInfo; }
+  });
+  const [pageDraft, setPageDraft] = useState<BusinessPageInfo>(pageInfo);
+  const [editPageOpen, setEditPageOpen] = useState(false);
+  const [pageError, setPageError] = useState("");
+
+  const businessName = pageInfo.name;
+  const firstName = businessName.split(" ")[0];
+  const today = useMemo(() => new Intl.DateTimeFormat("en-PH", { weekday: "long", month: "long", day: "numeric" }).format(new Date()), []);
+
+  useEffect(() => {
+    const onPopState = () => {
+      const route = window.location.hash.replace("#business/", "") as BusinessTab;
+      setTab(tabs.some((item) => item.id === route && route !== "create") ? route : "home");
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  function navigate(next: BusinessTab) {
+    if (next === "create") { setCreateOpen(true); return; }
+    setTab(next);
+    window.history.pushState({ businessTab: next }, "", `#business/${next}`);
+  }
+
+  function createItem(event: FormEvent) {
+    event.preventDefault();
+    if (!title.trim() || !mediaUrl) return;
+    if (category === "Events" && (!eventDate || !eventLocation.trim())) { setImageError("Add the event date and location."); return; }
+    if (category === "Promotions" && !promotionOffer.trim()) { setImageError("Add the promotion or offer details."); return; }
+    const next: BusinessItem[] = [{ id: crypto.randomUUID(), category, title: title.trim(), detail: detail.trim(), mediaUrl, mediaType, eventDate: category === "Events" ? eventDate : undefined, eventLocation: category === "Events" ? eventLocation.trim() : undefined, promotionOffer: category === "Promotions" ? promotionOffer.trim() : undefined, promotionEnds: category === "Promotions" ? promotionEnds : undefined, createdAt: new Date().toISOString() }, ...items];
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(next));
+      setItems(next);
+      window.dispatchEvent(new Event(BUSINESS_CONTENT_CHANGED_EVENT));
+      setTitle(""); setDetail(""); setMediaUrl(""); setMediaType("image"); setEventDate(""); setEventLocation(""); setPromotionOffer(""); setPromotionEnds(""); setImageError(""); setCreateOpen(false); navigate("my-business");
+    } catch {
+      setImageError("Your device does not have enough local storage for this image. Choose a smaller image.");
+    }
+  }
+
+  async function chooseMedia(file: File | undefined) {
+    if (!file) return;
+    setImageError("");
+    const isImage = file.type.startsWith("image/");
+    const isVideo = file.type.startsWith("video/");
+    if (!isImage && !isVideo) { setImageError("Choose a photo or video file."); return; }
+    if (isImage && file.size > MAX_UPLOAD_BYTES) { setImageError("Choose an image smaller than 10 MB."); return; }
+    if (isVideo && file.size > MAX_VIDEO_BYTES) { setImageError("Choose a video smaller than 3 MB so it can be saved on this device."); return; }
+    try {
+      setMediaType(isVideo ? "video" : "image");
+      setMediaUrl(isVideo ? await readFileAsDataUrl(file) : await resizeImage(file));
+    } catch (error) { setImageError(error instanceof Error ? error.message : "That media file could not be opened."); }
+  }
+
+  function openPageEditor() {
+    setPageDraft(pageInfo);
+    setPageError("");
+    setEditPageOpen(true);
+  }
+
+  async function choosePageImage(file: File | undefined, field: "coverUrl" | "logoUrl") {
+    if (!file) return;
+    setPageError("");
+    if (!file.type.startsWith("image/")) { setPageError("Choose an image file for your business page."); return; }
+    if (file.size > MAX_UPLOAD_BYTES) { setPageError("Choose an image smaller than 10 MB."); return; }
+    try {
+      const resized = await resizeImage(file);
+      setPageDraft((current) => ({ ...current, [field]: resized }));
+    }
+    catch (error) { setPageError(error instanceof Error ? error.message : "That image could not be opened."); }
+  }
+
+  function savePageInfo(event: FormEvent) {
+    event.preventDefault();
+    if (!pageDraft.name.trim() || !pageDraft.category.trim()) { setPageError("Add your business name and category."); return; }
+    const next = { ...pageDraft, name: pageDraft.name.trim(), category: pageDraft.category.trim(), about: pageDraft.about.trim() };
+    try {
+      localStorage.setItem(pageStorageKey, JSON.stringify(next));
+      setPageInfo(next);
+      window.dispatchEvent(new Event(BUSINESS_CONTENT_CHANGED_EVENT));
+      setEditPageOpen(false);
+    } catch {
+      setPageError("Your device does not have enough storage. Try smaller banner and profile images.");
+    }
+  }
+
+  function setBusinessScale(businessScale: BusinessPageInfo["businessScale"]) {
+    const next = { ...pageInfo, businessScale };
+    localStorage.setItem(pageStorageKey, JSON.stringify(next));
+    setPageInfo(next);
+    window.dispatchEvent(new Event(BUSINESS_CONTENT_CHANGED_EVENT));
+    setPageDraft(next);
+  }
+
+  return (
+    <div className="business-app-shell">
+      <main className="business-app-content">
+        {tab === "home" && <div className="business-screen">
+          <header className="business-topbar"><div><span className="business-overline">HILINGA BUSINESS</span><h1>Good day, {firstName}</h1><p>{today}</p></div><button className="business-alert-button" aria-label="Notifications"><Icon name="notifications" size={22} /></button></header>
+          <section className="business-welcome-card"><span className="business-welcome-icon"><Icon name="storefront" size={27} /></span><div><span>BUSINESS OVERVIEW</span><h2>{businessName}</h2><p>Your dashboard is ready. Add your first offering to start building your presence.</p></div><button onClick={() => navigate("my-business")}>Manage <Icon name="arrow_forward" size={17} /></button></section>
+          <section><div className="business-section-heading"><div><span>TODAY</span><h2>At a glance</h2></div></div><div className="business-stats"><article><Icon name="visibility" /><strong>0</strong><span>Profile views</span></article><article><Icon name="forum" /><strong>0</strong><span>Inquiries</span></article><article><Icon name="inventory_2" /><strong>{items.length}</strong><span>Published items</span></article></div></section>
+          <section><div className="business-section-heading"><div><span>NEXT STEPS</span><h2>Grow your presence</h2></div></div><div className="business-task-list"><button onClick={() => navigate("my-business")}><span><Icon name="domain_add" /></span><div><strong>Complete your business details</strong><p>Add your location, hours, and contact information.</p></div><Icon name="chevron_right" /></button><button onClick={() => setCreateOpen(true)}><span><Icon name="add_circle" /></span><div><strong>Create your first offering</strong><p>Publish a listing, product, service, or promotion.</p></div><Icon name="chevron_right" /></button></div></section>
+        </div>}
+
+        {tab === "my-business" && <div className="business-page-screen">
+          <section className="business-social-page">
+            <div className={`business-cover ${pageInfo.coverUrl ? "has-image" : ""}`} style={pageInfo.coverUrl ? { backgroundImage: `url(${pageInfo.coverUrl})` } : undefined}>
+              {!pageInfo.coverUrl && <div><Icon name="landscape" size={34} /><span>Add a cover photo</span></div>}
+              <button onClick={openPageEditor}><Icon name="photo_camera" size={18} /><span>Edit cover</span></button>
+            </div>
+            <div className="business-page-intro">
+              <div className="business-page-logo">{pageInfo.logoUrl ? <img src={pageInfo.logoUrl} alt={`${businessName} profile`} /> : <Icon name="storefront" size={42} />}</div>
+              <div className="business-page-title">
+                <div><h1>{businessName}</h1><span className="business-verified" title="Verified business"><Icon name="verified" size={21} /></span></div>
+                <p>{pageInfo.category} · {pageInfo.location || "Location not added"}</p>
+                <div className="business-rating" aria-label="Rated 4.8 out of 5 from 24 reviews"><strong>4.8</strong><span>★★★★★</span><button>24 reviews</button></div>
+              </div>
+              <button className="business-edit-page-button" onClick={openPageEditor}><Icon name="edit" size={18} /> Edit Page</button>
+            </div>
+            <div className="business-page-actions"><button className="primary" onClick={() => setCreateOpen(true)}><Icon name="add" size={20} /> Create</button><button><Icon name="chat" size={19} /> Message</button><button onClick={openPageEditor}><Icon name="more_horiz" size={20} /> More</button></div>
+          </section>
+
+          <section className="business-discovery-type" aria-label="Explore listing type">
+            <div><span>EXPLORE LISTING</span><strong>How should this business appear?</strong><p>This places your page in the matching Explore showcase.</p></div>
+            <div>{(["Small business", "Big enterprise"] as const).map((value) => <button key={value} className={pageInfo.businessScale === value ? "selected" : ""} onClick={() => setBusinessScale(value)}><Icon name={value === "Small business" ? "storefront" : "apartment"} size={19} />{value}</button>)}</div>
+          </section>
+
+          <div className="business-page-columns">
+            <div className="business-page-sidebar">
+              <section className="business-page-card business-about-card"><div className="business-card-heading"><h2>About Us</h2><button onClick={openPageEditor}>Edit</button></div><p>{pageInfo.about || "Add your business story so customers can learn more about you."}</p></section>
+              <section className="business-page-card business-info-card"><div className="business-card-heading"><h2>Business information</h2><button onClick={openPageEditor}><Icon name="edit" size={17} /></button></div><ul><li><Icon name="category" size={19} /><div><span>Category</span><strong>{pageInfo.category}</strong></div></li><li><Icon name="location_on" size={19} /><div><span>Location</span><strong>{pageInfo.location || "Add location"}</strong></div></li><li><Icon name="schedule" size={19} /><div><span>Business hours</span><strong>{pageInfo.hours || "Add business hours"}</strong></div></li><li><Icon name="call" size={19} /><div><span>Phone</span><strong>{pageInfo.phone || "Add phone number"}</strong></div></li><li><Icon name="mail" size={19} /><div><span>Email</span><strong>{pageInfo.email || "Add email address"}</strong></div></li></ul></section>
+            </div>
+            <section className="business-page-card business-posts-card"><div className="business-card-heading"><div><span>PAGE CONTENT</span><h2>Posts</h2></div><button onClick={() => setCreateOpen(true)}>+ Add new</button></div>{items.length === 0 ? <EmptyBusinessState icon="post_add" title="Create your first post" body="Share photos or videos, announce an event, or publish a promotion." /> : <div className="business-social-posts">{items.map((item) => {
+              const postCategory = item.category ?? (item.kind === "Promotion" ? "Promotions" : item.kind === "Events" ? "Events" : "Photos & Videos");
+              const postMedia = item.mediaUrl ?? item.imageUrl;
+              return <article key={item.id} className={`business-category-${postCategory.toLowerCase().replace(/[^a-z]+/g, "-")}`}><header><div className="business-post-avatar">{pageInfo.logoUrl ? <img src={pageInfo.logoUrl} alt="" /> : <Icon name="storefront" size={20} />}</div><div><strong>{businessName} <span className="business-inline-verified"><Icon name="verified" size={15} /></span></strong><small>{new Date(item.createdAt).toLocaleDateString("en-PH", { month: "long", day: "numeric" })}</small></div><span className="business-post-category"><Icon name={postCategory === "Events" ? "event" : postCategory === "Promotions" ? "campaign" : "perm_media"} size={14} />{postCategory}</span></header><h3>{item.title}</h3>{item.detail && <p>{item.detail}</p>}{postCategory === "Events" && <div className="business-post-detail"><Icon name="event" size={18} /><div><strong>{item.eventDate ? new Date(`${item.eventDate}T00:00:00`).toLocaleDateString("en-PH", { weekday: "short", month: "long", day: "numeric", year: "numeric" }) : "Date to be announced"}</strong><span><Icon name="location_on" size={14} />{item.eventLocation || "Location to be announced"}</span></div></div>}{postCategory === "Promotions" && <div className="business-post-detail business-promo-detail"><Icon name="local_offer" size={18} /><div><strong>{item.promotionOffer || "Special promotion"}</strong><span>{item.promotionEnds ? `Available until ${new Date(`${item.promotionEnds}T00:00:00`).toLocaleDateString("en-PH", { month: "long", day: "numeric", year: "numeric" })}` : "Limited-time offer"}</span></div></div>}{postMedia && (item.mediaType === "video" ? <video src={postMedia} className="business-post-image" controls playsInline /> : <img src={postMedia} alt={item.title} className="business-post-image" />)}<footer><button><Icon name="thumb_up" size={18} /> Like</button><button><Icon name="chat_bubble" size={18} /> Comment</button><button><Icon name="share" size={18} /> Share</button></footer></article>;
+            })}</div>}</section>
+          </div>
+        </div>}
+
+        {tab === "inbox" && <div className="business-screen"><header className="business-page-header"><span>MESSAGES</span><h1>Inbox</h1><p>Customer inquiries, conversations, and notifications.</p></header><div className="business-filter-pills"><button className="selected">All</button><button>Unread</button><button>Notifications</button></div><EmptyBusinessState icon="mark_email_unread" title="Your inbox is ready" body="New customer messages and business notifications will appear here." /></div>}
+
+        {tab === "profile" && <div className="business-screen"><header className="business-page-header"><span>ACCOUNT</span><h1>Business Profile</h1><p>Manage your business account settings and access.</p></header><section className="business-account-card"><div className="business-profile-avatar">{avatarUrl ? <img src={avatarUrl} alt="" /> : businessName.charAt(0).toUpperCase()}</div><div><strong>{businessName}</strong><span>{user?.email ?? "Signed in"}</span><small><Icon name="verified_user" size={14} /> Secure account</small></div></section><section className="business-settings-card"><button><Icon name="badge" /><span><strong>Account information</strong><small>Business identity and contact details</small></span><Icon name="chevron_right" /></button><button><Icon name="notifications" /><span><strong>Notification settings</strong><small>Inquiries, updates, and promotions</small></span><Icon name="chevron_right" /></button><button><Icon name="shield" /><span><strong>Privacy & security</strong><small>Password and account access</small></span><Icon name="chevron_right" /></button><button className="business-logout" onClick={() => void signOut()}><Icon name="logout" /><span><strong>Sign out</strong><small>Return to account selection</small></span></button></section></div>}
+      </main>
+
+      <nav className="business-tab-dock" aria-label="Business navigation"><div role="tablist">{tabs.map((item) => item.id === "create" ? <button key={item.id} className="business-create-tab" onClick={() => navigate(item.id)} aria-label="Create new business content"><span><Icon name="add" size={32} /></span><small>CREATE</small></button> : <button key={item.id} className={`business-tab ${tab === item.id ? "selected" : ""}`} onClick={() => navigate(item.id)} role="tab" aria-selected={tab === item.id}><Icon name={item.icon} size={22} /><span>{item.label}</span></button>)}</div></nav>
+
+      {createOpen && <div className="business-modal-backdrop" onClick={(event) => event.target === event.currentTarget && setCreateOpen(false)}><form className="business-create-sheet" onSubmit={createItem}><div className="business-sheet-handle" /><header><div><span>CREATE POST</span><h2>Choose a post category</h2></div><button type="button" onClick={() => setCreateOpen(false)} aria-label="Close"><Icon name="close" /></button></header><div className="business-kind-grid business-category-grid">{(["Photos & Videos", "Events", "Promotions"] as BusinessPostCategory[]).map((value) => <button type="button" key={value} className={category === value ? "selected" : ""} onClick={() => { setCategory(value); setImageError(""); }}><Icon name={{ "Photos & Videos": "perm_media", Events: "event", Promotions: "campaign" }[value]} size={22} /><span>{value}</span></button>)}</div><div className="business-image-field"><span className="business-image-label">Photo or video</span>{mediaUrl ? <div className="business-image-preview">{mediaType === "video" ? <video src={mediaUrl} aria-label="Video upload preview" controls playsInline /> : <img src={mediaUrl} alt="Upload preview" />}<div><label htmlFor="business-media-upload"><Icon name="photo_camera" size={18} /> Replace</label><button type="button" onClick={() => setMediaUrl("")}><Icon name="delete" size={18} /> Remove</button></div></div> : <label className="business-image-upload" htmlFor="business-media-upload"><Icon name="add_photo_alternate" size={30} /><strong>Upload a photo or video</strong><span>Images up to 10 MB · Videos up to 3 MB</span></label>}<input id="business-media-upload" className="file-input-hidden" type="file" accept="image/*,video/*" onChange={(event) => void chooseMedia(event.target.files?.[0])} />{imageError && <p className="business-image-error" role="alert">{imageError}</p>}</div><label>Post title<input value={title} onChange={(event) => setTitle(event.target.value)} placeholder={category === "Events" ? "Name your event" : category === "Promotions" ? "Name your promotion" : "Add a title"} /></label>{category === "Events" && <div className="business-editor-grid"><label>Event date<input type="date" value={eventDate} onChange={(event) => setEventDate(event.target.value)} /></label><label>Event location<input value={eventLocation} onChange={(event) => setEventLocation(event.target.value)} placeholder="Venue or address" /></label></div>}{category === "Promotions" && <div className="business-editor-grid"><label>Offer details<input value={promotionOffer} onChange={(event) => setPromotionOffer(event.target.value)} placeholder="e.g. 20% off all tours" /></label><label>Offer ends <small>(optional)</small><input type="date" value={promotionEnds} onChange={(event) => setPromotionEnds(event.target.value)} /></label></div>}<label>Caption <small>(optional)</small><textarea value={detail} onChange={(event) => setDetail(event.target.value)} placeholder="Write something about this post" /></label><button className="business-publish-button" type="submit" disabled={!title.trim() || !mediaUrl}>Publish to {category}</button></form></div>}
+
+      {editPageOpen && <div className="business-modal-backdrop" onClick={(event) => event.target === event.currentTarget && setEditPageOpen(false)}><form className="business-create-sheet business-page-editor" onSubmit={savePageInfo}><div className="business-sheet-handle" /><header><div><span>BUSINESS PAGE</span><h2>Edit business information</h2></div><button type="button" onClick={() => setEditPageOpen(false)} aria-label="Close"><Icon name="close" /></button></header><div className="business-page-image-editors"><label htmlFor="business-cover-upload"><span>Banner</span><div className="business-editor-cover">{pageDraft.coverUrl ? <img src={pageDraft.coverUrl} alt="Cover preview" /> : <Icon name="landscape" size={28} />}<strong><Icon name="photo_camera" size={17} /> {pageDraft.coverUrl ? "Replace" : "Upload"}</strong></div></label><label htmlFor="business-logo-upload"><span>Profile picture</span><div className="business-editor-logo">{pageDraft.logoUrl ? <img src={pageDraft.logoUrl} alt="Profile preview" /> : <Icon name="storefront" size={26} />}<strong><Icon name="photo_camera" size={16} /></strong></div></label><input id="business-cover-upload" className="file-input-hidden" type="file" accept="image/*" onChange={(event) => void choosePageImage(event.target.files?.[0], "coverUrl")} /><input id="business-logo-upload" className="file-input-hidden" type="file" accept="image/*" onChange={(event) => void choosePageImage(event.target.files?.[0], "logoUrl")} /></div><label>Business name<input value={pageDraft.name} onChange={(event) => setPageDraft({ ...pageDraft, name: event.target.value })} placeholder="Business name" /></label><label>Category<input value={pageDraft.category} onChange={(event) => setPageDraft({ ...pageDraft, category: event.target.value })} placeholder="Cafe, tours, retail..." /></label><label>Location<input value={pageDraft.location} onChange={(event) => setPageDraft({ ...pageDraft, location: event.target.value })} placeholder="City, province" /></label><div className="business-editor-grid"><label>Phone<input type="tel" value={pageDraft.phone} onChange={(event) => setPageDraft({ ...pageDraft, phone: event.target.value })} placeholder="Phone number" /></label><label>Email<input type="email" value={pageDraft.email} onChange={(event) => setPageDraft({ ...pageDraft, email: event.target.value })} placeholder="Business email" /></label></div><label>Business hours<input value={pageDraft.hours} onChange={(event) => setPageDraft({ ...pageDraft, hours: event.target.value })} placeholder="e.g. Mon–Sat · 9:00 AM–6:00 PM" /></label><label>About Us<textarea value={pageDraft.about} onChange={(event) => setPageDraft({ ...pageDraft, about: event.target.value })} placeholder="Tell customers about your business" /></label>{pageError && <p className="business-image-error" role="alert">{pageError}</p>}<button className="business-publish-button" type="submit">Save business page</button></form></div>}
+    </div>
+  );
+}

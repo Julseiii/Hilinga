@@ -1,0 +1,99 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    match /profiles/{userId} {
+      allow read, delete: if isOwner(userId);
+      allow create, update: if isOwner(userId)
+        && request.resource.data.id == userId;
+    }
+
+    match /users/{userId}/savedPlaces/{placeId} {
+      allow read, delete: if isOwner(userId);
+      allow create, update: if isOwner(userId)
+        && request.resource.data.keys().hasOnly([
+          'title', 'subtitle', 'kind', 'imageKey', 'createdAt'
+        ])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 200
+        && request.resource.data.subtitle is string
+        && request.resource.data.subtitle.size() <= 500
+        && request.resource.data.kind in [
+          'Places', 'Itineraries', 'Businesses', 'Events'
+        ]
+        && (request.resource.data.imageKey == null
+          || request.resource.data.imageKey is string)
+        && request.resource.data.createdAt is string;
+    }
+
+    match /users/{userId}/tripPlans/{planId} {
+      allow read, delete: if isOwner(userId);
+      allow create, update: if isOwner(userId)
+        && request.resource.data.keys().hasOnly([
+          'title', 'preferences', 'itinerary', 'createdAt'
+        ])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 200
+        && request.resource.data.preferences is map
+        && request.resource.data.preferences.keys().hasOnly([
+          'durationHours', 'budget', 'transportation', 'interests',
+          'walkingAbility'
+        ])
+        && request.resource.data.preferences.durationHours is int
+        && request.resource.data.preferences.durationHours >= 1
+        && request.resource.data.preferences.durationHours <= 168
+        && (request.resource.data.preferences.budget == null
+          || request.resource.data.preferences.budget is number)
+        && request.resource.data.preferences.transportation is string
+        && request.resource.data.preferences.interests is list
+        && request.resource.data.preferences.walkingAbility is string
+        && request.resource.data.itinerary is list
+        && request.resource.data.createdAt is string;
+    }
+
+    match /communityPosts/{postId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasOnly([
+          'authorUid', 'authorName', 'authorAvatarUrl', 'placeName',
+          'location', 'category', 'experience', 'rating', 'createdAt'
+        ])
+        && request.resource.data.authorUid == request.auth.uid
+        && request.resource.data.authorName is string
+        && request.resource.data.authorName.size() > 0
+        && request.resource.data.authorName.size() <= 80
+        && (request.resource.data.authorAvatarUrl == null
+          || request.resource.data.authorAvatarUrl is string)
+        && request.resource.data.placeName is string
+        && request.resource.data.placeName.size() > 0
+        && request.resource.data.placeName.size() <= 120
+        && request.resource.data.location is string
+        && request.resource.data.location.size() <= 160
+        && request.resource.data.category in [
+          'Place', 'Restaurant', 'Cafe', 'Accommodation', 'Shop', 'Event',
+          'Activity'
+        ]
+        && request.resource.data.experience is string
+        && request.resource.data.experience.size() >= 10
+        && request.resource.data.experience.size() <= 1500
+        && (request.resource.data.rating == null
+          || (request.resource.data.rating is int
+            && request.resource.data.rating >= 1
+            && request.resource.data.rating <= 5))
+        && request.resource.data.createdAt == request.time;
+      allow update: if false;
+      allow delete: if request.auth != null
+        && resource.data.authorUid == request.auth.uid;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
