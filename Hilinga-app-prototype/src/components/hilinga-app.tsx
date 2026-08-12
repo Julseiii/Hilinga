@@ -20,8 +20,10 @@ import {
   getTripPlans,
   removeSavedItem,
   saveItem,
+  updateTripPlan,
 } from "@/lib/cloud-user-data";
 import type { AvatarUpload } from "@/lib/cloud-profile";
+import { generateAiItinerary } from "@/lib/ai-itinerary";
 import {
   BUSINESS_CONTENT_CHANGED_EVENT,
   BusinessPost,
@@ -129,6 +131,17 @@ function distanceKm(from: { latitude: number; longitude: number }, to: { latitud
 
 function resolveRouteDestination(title: string) {
   const normalized = title.toLowerCase();
+  const registeredBiz = readRegisteredSmallBusinesses();
+  const bizMatch = registeredBiz.find((biz) => normalized.includes(biz.name.toLowerCase()) || biz.name.toLowerCase().includes(normalized));
+  if (bizMatch) {
+    return {
+      id: `registered-${bizMatch.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
+      name: bizMatch.name,
+      subtitle: `${bizMatch.category} • Registered Local Business (${bizMatch.location})`,
+      latitude: 13.1390,
+      longitude: 123.7336,
+    };
+  }
   const match = routeDestinations.find((destination) => normalized.includes(destination.name.toLowerCase()) || destination.name.toLowerCase().includes(normalized));
   if (match) return match;
   if (normalized.includes("cagsawa") || normalized.includes("atv")) return catalog[0];
@@ -502,7 +515,7 @@ function Home({ setTab, openMap, openEmergency, showNotice }: { setTab: (tab: Ta
   );
 }
 
-function MapScreen({ onClose, initialPlanId }: { onClose: () => void; initialPlanId?: string | null }) {
+function MapScreen({ initialPlanId, onClose }: { initialPlanId?: string | null; onClose: () => void }) {
   const db = useDatabase();
   const { user } = useAuth();
   const [selectedId, setSelectedId] = useState("");
@@ -518,12 +531,31 @@ function MapScreen({ onClose, initialPlanId }: { onClose: () => void; initialPla
   const [liveLocation, setLiveLocation] = useState<(MapPlace & { accuracy: number }) | null>(null);
   const [locationError, setLocationError] = useState<string | null>(null);
   const [startPointId, setStartPointId] = useState("current-location");
-  const [destinationId, setDestinationId] = useState(catalog[0].id);
+  const [destinationId, setDestinationId] = useState("");
   const [droppedPin, setDroppedPin] = useState<MapPlace | null>(null);
   const [routeGeometry, setRouteGeometry] = useState<[number, number][]>([]);
   const [autoRoute, setAutoRoute] = useState<{ distanceKm: number; durationMinutes: number } | null>(null);
   const [autoRouteLoading, setAutoRouteLoading] = useState(false);
   const [autoRouteError, setAutoRouteError] = useState<string | null>(null);
+
+  // Waze auto-navigation, transport routes, and place replacement state
+  const [isNavigating, setIsNavigating] = useState(false);
+  const [currentNavStopIndex, setCurrentNavStopIndex] = useState(0);
+  const [navToast, setNavToast] = useState<string | null>(null);
+  const [replaceTarget, setReplaceTarget] = useState<{ day: number; stopIndex: number; currentTitle: string } | null>(null);
+  const [registeredBusinesses, setRegisteredBusinesses] = useState<RegisteredSmallBusiness[]>(() => readRegisteredSmallBusinesses());
+  const [showTransportRoutes, setShowTransportRoutes] = useState(true);
+  const [showRegisteredBusinesses, setShowRegisteredBusinesses] = useState(true);
+
+  useEffect(() => {
+    const refreshBusinesses = () => setRegisteredBusinesses(readRegisteredSmallBusinesses());
+    window.addEventListener(BUSINESS_CONTENT_CHANGED_EVENT, refreshBusinesses);
+    window.addEventListener("storage", refreshBusinesses);
+    return () => {
+      window.removeEventListener(BUSINESS_CONTENT_CHANGED_EVENT, refreshBusinesses);
+      window.removeEventListener("storage", refreshBusinesses);
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -549,12 +581,15 @@ function MapScreen({ onClose, initialPlanId }: { onClose: () => void; initialPla
   const routeStops = useMemo(() => selectedPlan ? buildMapRoute(selectedPlan) : [], [selectedPlan]);
   const routeDays = useMemo(() => Array.from(new Set(routeStops.map((stop) => stop.day))), [routeStops]);
   const visibleRouteStops = useMemo(() => routeStops.filter((stop) => stop.day === activeDay), [activeDay, routeStops]);
+  const activeNavStop = isNavigating ? (visibleRouteStops[currentNavStopIndex] ?? visibleRouteStops[0]) : null;
   const selectedStop = visibleRouteStops.find((stop) => stop.id === selectedId);
   const selectedPlace = catalog.find((place) => place.id === selectedId);
   const totalMinutes = visibleRouteStops.reduce((total, stop) => total + stop.travelMinutes, 0);
   const progressStorageKey = user && selectedPlanId ? `hilinga-route-progress:${user.uid}:${selectedPlanId}` : "";
   const startPoint = startPointId === "current-location" ? liveLocation : routeDestinations.find((place) => place.id === startPointId) ?? null;
-  const destination = droppedPin ?? routeDestinations.find((place) => place.id === destinationId) ?? null;
+  const destination = isNavigating && activeNavStop
+    ? activeNavStop
+    : (droppedPin ?? routeDestinations.find((place) => place.id === destinationId) ?? null);
   const pointToPointActive = Boolean(destination && startPoint);
   const mapDestination = droppedPin ?? (startPoint ? destination : null);
   const pointToPointDistance = autoRoute?.distanceKm ?? (startPoint && destination ? Math.round(distanceKm(startPoint, destination) * 10) / 10 : null);
@@ -629,22 +664,11 @@ function MapScreen({ onClose, initialPlanId }: { onClose: () => void; initialPla
   }, [showRoute, visibleRouteStops]);
 
   useEffect(() => {
-    if (!progressStorageKey) {
-      setCompletedStops(new Set());
-      return;
-    }
-    try {
-      const stored = JSON.parse(localStorage.getItem(progressStorageKey) ?? "[]") as unknown;
-      setCompletedStops(new Set(Array.isArray(stored) ? stored.filter((value): value is string => typeof value === "string") : []));
-    } catch {
-      setCompletedStops(new Set());
-    }
-  }, [progressStorageKey]);
-
-  useEffect(() => {
     setActiveDay(routeDays[0] ?? 1);
     setCompletedDayPrompt(null);
     setShowRoute(Boolean(selectedPlanId));
+    setCurrentNavStopIndex(0);
+    setIsNavigating(false);
   }, [selectedPlanId, routeDays]);
 
   function markStopDone(stop: MapRouteStop) {
@@ -664,6 +688,7 @@ function MapScreen({ onClose, initialPlanId }: { onClose: () => void; initialPla
     if (nextDay !== undefined) {
       setActiveDay(nextDay);
       setShowRoute(true);
+      setCurrentNavStopIndex(0);
     }
     setCompletedDayPrompt(null);
   }
@@ -698,6 +723,71 @@ function MapScreen({ onClose, initialPlanId }: { onClose: () => void; initialPla
     window.open(`https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(target)}&travelmode=driving`, "_blank", "noopener,noreferrer");
   }
 
+  function startNavigationMode() {
+    if (!visibleRouteStops.length) return;
+    setIsNavigating(true);
+    setShowRoute(true);
+    setStartPointId("current-location");
+    if (!hasLiveLocation) setLiveTracking(true);
+    setCurrentNavStopIndex(0);
+    setSelectedId(visibleRouteStops[0].id);
+    setNavToast(`Started active auto-routing to Stop 1: ${visibleRouteStops[0].name}`);
+    setTimeout(() => setNavToast(null), 4000);
+  }
+
+  function advanceNavToNextStop() {
+    if (!activeNavStop) return;
+    markStopDone(activeNavStop);
+    if (currentNavStopIndex + 1 < visibleRouteStops.length) {
+      const nextIndex = currentNavStopIndex + 1;
+      setCurrentNavStopIndex(nextIndex);
+      const nextStop = visibleRouteStops[nextIndex];
+      setSelectedId(nextStop.id);
+      setNavToast(`Reached Stop ${currentNavStopIndex + 1}! Auto-routing to Stop ${nextIndex + 1}: ${nextStop.name}...`);
+    } else {
+      const currentIndex = routeDays.indexOf(activeDay);
+      const nextDay = routeDays[currentIndex + 1];
+      if (nextDay !== undefined) {
+        setActiveDay(nextDay);
+        setCurrentNavStopIndex(0);
+        setNavToast(`Day ${activeDay} completed! Auto-routing to Day ${nextDay} stops...`);
+      } else {
+        setNavToast("🎉 Congratulations! You completed all stops in this itinerary.");
+        setIsNavigating(false);
+      }
+    }
+    setTimeout(() => setNavToast(null), 4000);
+  }
+
+  async function handleSelectReplacement(newTitle: string) {
+    if (!replaceTarget || !selectedPlan) return;
+    const { day, stopIndex } = replaceTarget;
+    const updatedItinerary = (selectedPlan.itinerary ?? []).map((dayPlan) => {
+      if (dayPlan.day !== day) return dayPlan;
+      const newStops = [...dayPlan.stops];
+      if (newStops[stopIndex]) {
+        newStops[stopIndex] = {
+          ...newStops[stopIndex],
+          title: newTitle,
+          note: `Customized stop: ${newTitle}.`,
+        };
+      }
+      return { ...dayPlan, stops: newStops };
+    });
+
+    try {
+      if (user) {
+        await updateTripPlan(db, user.uid, selectedPlan.id, { itinerary: updatedItinerary });
+        const loaded = await getTripPlans(db, user.uid);
+        setPlans(loaded);
+      }
+      setNavToast(`Replaced stop with "${newTitle}". Route updated!`);
+      setTimeout(() => setNavToast(null), 4000);
+    } catch {
+      setRouteError("Could not save updated place into itinerary.");
+    }
+  }
+
   return (
     <div className="map-screen">
       <div className="map-header">
@@ -705,29 +795,71 @@ function MapScreen({ onClose, initialPlanId }: { onClose: () => void; initialPla
           <Icon name="arrow_back" size={23} color="var(--c-green)" />
         </button>
         <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 2 }}>
-          <h1 className="page-title">Map tools</h1>
-          <span style={{ color: "var(--c-body)", fontSize: 13 }}>{pointToPointActive ? `Routing to ${destination?.name}` : selectedStop?.name ?? selectedPlace?.name ?? "Plan a route or explore nearby places."}</span>
+          <h1 className="page-title">{isNavigating ? "Active Auto-Navigation" : "Map tools"}</h1>
+          <span style={{ color: "var(--c-body)", fontSize: 13 }}>
+            {isNavigating
+              ? `Auto-routing to ${activeNavStop?.name ?? "destination"}`
+              : pointToPointActive
+                ? `Routing to ${destination?.name}`
+                : selectedStop?.name ?? selectedPlace?.name ?? "Plan a route or explore nearby places."}
+          </span>
         </div>
       </div>
 
-      <Card className="live-route-controls">
-        <div className="live-route-heading">
-          <div><span>LIVE NAVIGATION</span><strong>Start and destination</strong></div>
-          <button className={`live-location-switch ${liveTracking ? "live-location-switch-active" : ""}`} role="switch" aria-checked={liveTracking} onClick={toggleLiveLocation}>
-            <span className="live-location-switch-track"><i /></span>
-            <Icon name="my_location" size={17} />{liveTracking ? "Live on" : "Use live location"}
+      {navToast && (
+        <div className="nav-toast" role="status">
+          <Icon name="navigation" size={18} color="white" />
+          <span>{navToast}</span>
+        </div>
+      )}
+
+      {isNavigating && activeNavStop && (
+        <Card className="nav-hud-top">
+          <div className="nav-hud-header">
+            <span className="nav-hud-badge">WAZE AUTO-ROUTING</span>
+            <span className="nav-hud-stop-badge">Stop {currentNavStopIndex + 1} of {visibleRouteStops.length} (Day {activeDay})</span>
+            <button className="nav-hud-exit-btn" onClick={() => setIsNavigating(false)}>Exit Waze Mode</button>
+          </div>
+          <div className="nav-hud-main">
+            <div className="nav-hud-icon-box">
+              <Icon name="navigation" size={24} color="white" />
+            </div>
+            <div className="nav-hud-copy">
+              <strong>{activeNavStop.name}</strong>
+              <span>{activeNavStop.directions}</span>
+            </div>
+          </div>
+          <div className="nav-hud-metrics">
+            <span><Icon name="schedule" size={16} />About {pointToPointMinutes ?? activeNavStop.travelMinutes} min</span>
+            <span><Icon name="straighten" size={16} />{pointToPointDistance ?? activeNavStop.travelDistanceKm} km</span>
+            <span><Icon name="directions_car" size={16} />{activeNavStop.terminal.transport}</span>
+          </div>
+          <button className="nav-hud-next-btn" onClick={advanceNavToNextStop}>
+            <Icon name="check_circle" size={20} color="white" /> Mark Reached & Auto-Route Next Location
           </button>
-        </div>
-        <div className="route-point-fields">
-          <label><span><i className="route-point-dot route-point-start" />Starting point</span><select value={startPointId} onChange={(event) => { setStartPointId(event.target.value); if (event.target.value !== "current-location") { setLiveTracking(false); setLiveLocation(null); } }}><option value="current-location">My current location</option>{routeDestinations.map((place) => <option key={`start-${place.id}`} value={place.id}>{place.name}</option>)}</select></label>
-          <button className="route-swap-button" onClick={swapRoutePoints} disabled={startPointId === "current-location"} aria-label="Swap starting point and destination"><Icon name="swap_vert" size={20} /></button>
-          <label><span><i className="route-point-dot route-point-destination" />Destination</span><select value={destinationId} onChange={(event) => { setDroppedPin(null); setDestinationId(event.target.value); }}>{droppedPin && <option value="dropped-pin">Dropped pin ({droppedPin.subtitle})</option>}{routeDestinations.map((place) => <option key={`destination-${place.id}`} value={place.id}>{place.name}</option>)}</select></label>
-        </div>
-        {startPointId === "current-location" && !liveLocation && <p className="live-location-hint"><Icon name={liveTracking ? "location_searching" : "info"} size={16} />{liveTracking ? "Finding your live location…" : "Turn on live location to use your position as the starting point."}</p>}
-        {locationError && <p className="live-location-error" role="alert"><Icon name="location_off" size={17} />{locationError}</p>}
-        {pointToPointActive && <div className="live-route-summary"><span><Icon name="route" size={16} />{pointToPointDistance} km {autoRoute ? "by road" : "estimated"}</span><span><Icon name="schedule" size={16} />{autoRouteLoading ? "Routing…" : `About ${pointToPointMinutes} min`}</span><button onClick={openDirections}><Icon name="navigation" size={17} />Start directions</button></div>}
-        {autoRouteError && <p className="live-location-error" role="status"><Icon name="warning" size={17} />{autoRouteError}</p>}
-      </Card>
+        </Card>
+      )}
+
+      {!isNavigating && (
+        <Card className="live-route-controls">
+          <div className="live-route-heading">
+            <div><span>LIVE NAVIGATION</span><strong>Start and destination</strong></div>
+            <button className={`live-location-switch ${liveTracking ? "live-location-switch-active" : ""}`} role="switch" aria-checked={liveTracking} onClick={toggleLiveLocation}>
+              <span className="live-location-switch-track"><i /></span>
+              <Icon name="my_location" size={17} />{liveTracking ? "Live on" : "Use live location"}
+            </button>
+          </div>
+          <div className="route-point-fields">
+            <label><span><i className="route-point-dot route-point-start" />Starting point</span><select value={startPointId} onChange={(event) => { setStartPointId(event.target.value); if (event.target.value !== "current-location") { setLiveTracking(false); setLiveLocation(null); } }}><option value="current-location">My current location</option>{routeDestinations.map((place) => <option key={`start-${place.id}`} value={place.id}>{place.name}</option>)}</select></label>
+            <button className="route-swap-button" onClick={swapRoutePoints} disabled={startPointId === "current-location"} aria-label="Swap starting point and destination"><Icon name="swap_vert" size={20} /></button>
+            <label><span><i className="route-point-dot route-point-destination" />Destination</span><select value={destinationId} onChange={(event) => { setDroppedPin(null); setDestinationId(event.target.value); }}>{droppedPin && <option value="dropped-pin">Dropped pin ({droppedPin.subtitle})</option>}{routeDestinations.map((place) => <option key={`destination-${place.id}`} value={place.id}>{place.name}</option>)}</select></label>
+          </div>
+          {startPointId === "current-location" && !liveLocation && <p className="live-location-hint"><Icon name={liveTracking ? "location_searching" : "info"} size={16} />{liveTracking ? "Finding your live location…" : "Turn on live location to use your position as the starting point."}</p>}
+          {locationError && <p className="live-location-error" role="alert"><Icon name="location_off" size={17} />{locationError}</p>}
+          {pointToPointActive && <div className="live-route-summary"><span><Icon name="route" size={16} />{pointToPointDistance} km {autoRoute ? "by road" : "estimated"}</span><span><Icon name="schedule" size={16} />{autoRouteLoading ? "Routing…" : `About ${pointToPointMinutes} min`}</span><button onClick={openDirections}><Icon name="navigation" size={17} />Start directions</button></div>}
+          {autoRouteError && <p className="live-location-error" role="status"><Icon name="warning" size={17} />{autoRouteError}</p>}
+        </Card>
+      )}
 
       <Card className="smart-map-controls">
         <label htmlFor="route-plan">Route a saved itinerary</label>
@@ -737,11 +869,25 @@ function MapScreen({ onClose, initialPlanId }: { onClose: () => void; initialPla
             {plans.length === 0 ? <option value="">No saved itinerary available</option> : plans.map((plan) => <option key={plan.id} value={plan.id}>{plan.title}</option>)}
           </select>
         </div>
-        {selectedPlan && <div className="smart-map-summary"><span><Icon name="location_on" size={16} />{routeStops.length} stops</span><span><Icon name="schedule" size={16} />About {totalMinutes} min travel</span><span><Icon name="conversion_path" size={16} />Auto-sequenced</span></div>}
         {selectedPlan && (
-          <button className={`smart-map-route-toggle ${showRoute ? "smart-map-route-toggle-active" : ""}`} onClick={() => setShowRoute((current) => !current)}>
-            <Icon name={showRoute ? "visibility_off" : "route"} size={19} />{showRoute ? "Hide itinerary route" : "Show itinerary route"}
-          </button>
+          <div className="smart-map-summary">
+            <span><Icon name="location_on" size={16} />{routeStops.length} stops</span>
+            <span><Icon name="schedule" size={16} />About {totalMinutes} min travel</span>
+            <span className="plan-budget-chip" style={{ border: 0, padding: "3px 9px", margin: 0 }}>
+              <Icon name="payments" size={15} color="var(--c-green)" />
+              {selectedPlan.preferences.budget !== null ? `₱${selectedPlan.preferences.budget.toLocaleString()}` : "Moderate"}
+            </span>
+          </div>
+        )}
+        {selectedPlan && (
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className={`smart-map-route-toggle ${showRoute ? "smart-map-route-toggle-active" : ""}`} style={{ flex: 1 }} onClick={() => setShowRoute((current) => !current)}>
+              <Icon name={showRoute ? "visibility_off" : "route"} size={19} />{showRoute ? "Hide route" : "Show route"}
+            </button>
+            <button className="smart-map-route-toggle" style={{ flex: 1, background: "var(--c-green)", color: "white", borderColor: "var(--c-green)" }} onClick={startNavigationMode}>
+              <Icon name="navigation" size={19} color="white" />Start Waze Mode
+            </button>
+          </div>
         )}
       </Card>
 
@@ -757,14 +903,46 @@ function MapScreen({ onClose, initialPlanId }: { onClose: () => void; initialPla
         </div>
       )}
 
-      <OpenStreetMap places={showRoute && !pointToPointActive ? visibleRouteStops : catalog} routeStops={showRoute && !pointToPointActive ? visibleRouteStops : []} selectedId={selectedId} onSelect={setSelectedId} liveLocation={liveLocation} startPoint={pointToPointActive ? startPoint : null} destination={mapDestination} routeGeometry={routeGeometry} onMapPress={chooseDestination} />
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", margin: "4px 0 8px 0" }}>
+        <button
+          type="button"
+          style={{ padding: "6px 12px", borderRadius: 999, fontSize: 12, fontWeight: 800, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6, background: showTransportRoutes ? "#FEF3C7" : "var(--c-chip)", color: showTransportRoutes ? "#92400E" : "var(--c-body)", border: "1px solid", borderColor: showTransportRoutes ? "#FCD34D" : "transparent" }}
+          onClick={() => setShowTransportRoutes((curr) => !curr)}
+        >
+          <Icon name="directions_bus" size={15} color={showTransportRoutes ? "#D97706" : "var(--c-muted)"} />
+          Transport Hubs & Routes
+        </button>
+        <button
+          type="button"
+          style={{ padding: "6px 12px", borderRadius: 999, fontSize: 12, fontWeight: 800, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6, background: showRegisteredBusinesses ? "#E8F5EE" : "var(--c-chip)", color: showRegisteredBusinesses ? "var(--c-green-dark)" : "var(--c-body)", border: "1px solid", borderColor: showRegisteredBusinesses ? "#C3E6D2" : "transparent" }}
+          onClick={() => setShowRegisteredBusinesses((curr) => !curr)}
+        >
+          <Icon name="storefront" size={15} color={showRegisteredBusinesses ? "var(--c-green)" : "var(--c-muted)"} />
+          Registered Businesses ({registeredBusinesses.length})
+        </button>
+      </div>
+
+      <OpenStreetMap
+        places={showRoute && visibleRouteStops.length > 0 ? visibleRouteStops : catalog}
+        routeStops={showRoute ? visibleRouteStops : []}
+        selectedId={selectedId}
+        onSelect={setSelectedId}
+        liveLocation={liveLocation}
+        startPoint={isNavigating || pointToPointActive ? startPoint : null}
+        destination={isNavigating || pointToPointActive ? mapDestination : null}
+        routeGeometry={routeGeometry}
+        onMapPress={chooseDestination}
+        registeredBusinesses={registeredBusinesses}
+        showTransportRoutes={showTransportRoutes}
+        showRegisteredBusinesses={showRegisteredBusinesses}
+      />
 
       {routeStops.length > 0 ? (
         <section className="smart-route-panel" aria-label="Itinerary route and terminals">
           <div className="smart-route-heading"><div><span className="eyebrow">Route guide</span><h2>Where to ride</h2></div><span className="route-estimate-badge">Estimates</span></div>
           <p className="smart-route-disclaimer">Travel times and town-center boarding points are planning estimates. Confirm the route and terminal locally; traffic, weather, queues, and drop-off points can change the trip.</p>
           <div className="smart-route-list">
-            {visibleRouteStops.map((stop) => (
+            {visibleRouteStops.map((stop, stopIndex) => (
               <article key={stop.id} className={`smart-route-leg ${selectedId === stop.id ? "smart-route-leg-selected" : ""} ${completedStops.has(stop.id) ? "smart-route-leg-done" : ""}`}>
                 <span className="smart-route-number">{stop.order}</span>
                 <button className="smart-route-copy" onClick={() => { setSelectedId(stop.id); setShowRoute(true); }}>
@@ -773,7 +951,13 @@ function MapScreen({ onClose, initialPlanId }: { onClose: () => void; initialPla
                   <span><Icon name="directions_bus" size={16} />{stop.terminal.name} <Icon name="arrow_forward" size={14} /> {stop.name}</span>
                   <small>{stop.directions}</small>
                 </button>
-                <span className="smart-route-actions"><span className="smart-route-time"><strong>{stop.travelMinutes} min</strong><small>{stop.travelDistanceKm} km</small></span><button className="smart-route-done-btn" onClick={() => markStopDone(stop)}><Icon name={completedStops.has(stop.id) ? "check_circle" : "radio_button_unchecked"} size={17} />{completedStops.has(stop.id) ? "Done" : "Mark done"}</button></span>
+                <span className="smart-route-actions">
+                  <span className="smart-route-time"><strong>{stop.travelMinutes} min</strong><small>{stop.travelDistanceKm} km</small></span>
+                  <button className="smart-route-done-btn" onClick={() => markStopDone(stop)}><Icon name={completedStops.has(stop.id) ? "check_circle" : "radio_button_unchecked"} size={17} />{completedStops.has(stop.id) ? "Done" : "Mark done"}</button>
+                  <button className="itinerary-replace-btn" style={{ marginTop: 4 }} onClick={() => setReplaceTarget({ day: stop.day, stopIndex, currentTitle: stop.name })}>
+                    <Icon name="swap_horiz" size={14} /> Replace
+                  </button>
+                </span>
               </article>
             ))}
           </div>
@@ -790,6 +974,13 @@ function MapScreen({ onClose, initialPlanId }: { onClose: () => void; initialPla
       ) : (
         <div className="smart-map-loading"><div className="spinner" /><span>Loading itinerary routes…</span></div>
       )}
+
+      <ReplacePlaceModal
+        visible={replaceTarget !== null}
+        target={replaceTarget}
+        onClose={() => setReplaceTarget(null)}
+        onSelectReplacement={handleSelectReplacement}
+      />
     </div>
   );
 }
@@ -1484,11 +1675,36 @@ type PlannerMessage = { id: number; role: "guide" | "user"; text: string };
 type PlannerOption = { label: string; value: string; icon: string; description?: string };
 type PlannerQuestion = { key: PlannerAnswerKey; prompt: string; kind: "single" | "multi" | "text" | "date-range"; options?: PlannerOption[]; optional?: boolean; placeholder?: string };
 
-const interestOptions = [
-  "Beaches and islands", "Nature and hiking", "Adventure activities", "Food and local cuisine",
-  "Culture and history", "Arts and museums", "Shopping", "Nightlife", "Photography",
-  "Wellness and relaxation", "Family-friendly activities", "Romantic experiences",
-  "Religious or spiritual sites", "Festivals and events", "Hidden gems", "Other interests specified by the user",
+function formatTravelersLabel(raw?: string): string {
+  if (!raw || !raw.trim()) return "your group";
+  const trimmed = raw.trim();
+  if (/^\d+$/.test(trimmed)) {
+    const num = parseInt(trimmed, 10);
+    return num === 1 ? "1 traveler" : `${num} travelers`;
+  }
+  if (trimmed.toLocaleLowerCase() === "family or group" || trimmed.toLocaleLowerCase() === "family / group") {
+    return "your group";
+  }
+  return trimmed;
+}
+
+const interestOptions: PlannerOption[] = [
+  { label: "Mayon & ATV Adventure", value: "Mayon Volcano and ATV adventure", icon: "hiking", description: "Lava wall, ATV trails & Mayon viewpoints" },
+  { label: "Nature & Hiking", value: "Nature and hiking", icon: "landscape", description: "Scenic hills, parks & mountain trails" },
+  { label: "Beaches & Islands", value: "Beaches and islands", icon: "beach_access", description: "Coastal shores, island hopping & water spots" },
+  { label: "Food & Local Cuisine", value: "Food and local cuisine", icon: "restaurant", description: "Bicol Express, Pinangat & Chili Ice Cream" },
+  { label: "Historic Sites & Ruins", value: "Historic sites and ruins", icon: "account_balance", description: "Cagsawa Ruins, Daraga Church & heritage" },
+  { label: "Waterfalls & Lakes", value: "Waterfalls and lakes", icon: "water_drop", description: "Vera Falls, Sumlang Lake & natural springs" },
+  { label: "Photography & Views", value: "Photography and viewpoints", icon: "photo_camera", description: "Ligñon Hill, Quitinday & Mayon views" },
+  { label: "Shopping & Souvenirs", value: "Shopping and souvenirs", icon: "shopping_bag", description: "Pili nuts, handicrafts & abaca woven goods" },
+  { label: "Arts & Museums", value: "Arts and museums", icon: "museum", description: "Bicol Heritage Museum & local art galleries" },
+  { label: "Wellness & Relaxation", value: "Wellness and relaxation", icon: "spa", description: "Hot springs, resorts & relaxing staycations" },
+  { label: "Family-Friendly Fun", value: "Family-friendly activities", icon: "family_restroom", description: "Parks, playgrounds & kid-safe outings" },
+  { label: "Romantic Experiences", value: "Romantic experiences", icon: "favorite", description: "Sunset dining, lakeside strolls & getaways" },
+  { label: "Churches & Shrines", value: "Religious or spiritual sites", icon: "church", description: "Historic Bicol churches & pilgrim sites" },
+  { label: "Festivals & Events", value: "Festivals and events", icon: "celebration", description: "Magayon Festival & local celebrations" },
+  { label: "Nightlife & Dining", value: "Nightlife", icon: "nightlife", description: "Evening lounges, food parks & local nightlife" },
+  { label: "Hidden Gems", value: "Hidden gems", icon: "explore", description: "Off-the-beaten-path spots & secret locations" },
 ];
 
 const defaultSections = ["Estimated costs", "Transportation instructions", "Travel times", "Restaurant recommendations", "Booking reminders"];
@@ -1498,15 +1714,29 @@ const sectionOptions = [
 ];
 
 const plannerQuestions: PlannerQuestion[] = [
-  { key: "destination", prompt: "Where in Albay would you like to go? You can choose the whole province or a specific city or attraction.", kind: "text", options: [{ label: "Albay", value: "Albay", icon: "location_on" }], placeholder: "e.g. Albay, Legazpi, Daraga, or Mayon" },
+  { key: "destination", prompt: "Where in Albay would you like to go? You can choose the whole province or a specific city or attraction.", kind: "text", options: [
+    { label: "Whole Albay Province", value: "Albay", icon: "location_on", description: "Explore provincial highlights" },
+    { label: "Legazpi City & Downtown", value: "Legazpi City", icon: "location_city", description: "Boulevard, Ligñon Hill & dining" },
+    { label: "Daraga & Cagsawa", value: "Daraga", icon: "church", description: "Cagsawa Ruins & Daraga Church" },
+    { label: "Mayon Volcano Foothills", value: "Mayon Volcano", icon: "landscape", description: "ATV trails & lava wall viewpoints" },
+    { label: "Tabaco City & Coastal", value: "Tabaco City", icon: "storefront", description: "Port area, historic church & markets" },
+  ], placeholder: "e.g. Albay, Legazpi, Daraga, or Mayon" },
   { key: "dates", prompt: "What are your travel dates?", kind: "date-range" },
   { key: "days", prompt: "How many travel days should I plan?", kind: "single", options: [
-    { label: "1 day", value: "1", icon: "sunny" }, { label: "2 days", value: "2", icon: "date_range" }, { label: "3 days", value: "3", icon: "calendar_month" },
+    { label: "1 day", value: "1", icon: "sunny", description: "Day trip highlights" },
+    { label: "2 days", value: "2", icon: "date_range", description: "Weekend getaway" },
+    { label: "3 days", value: "3", icon: "calendar_month", description: "Full Albay experience" },
+    { label: "4 days", value: "4", icon: "event_repeat", description: "Extended exploration" },
+    { label: "5 days", value: "5", icon: "view_week", description: "Comprehensive tour" },
   ] },
   { key: "travelers", prompt: "How many people are traveling?", kind: "text", options: [
-    { label: "1 traveler", value: "1", icon: "person" }, { label: "2 travelers", value: "2", icon: "group" }, { label: "Family / group", value: "Family or group", icon: "groups" },
-  ], placeholder: "Enter the number and age group, if relevant" },
-  { key: "interests", prompt: "What activities interest you? You may select as many as you like.", kind: "multi", options: interestOptions.map((value) => ({ label: value, value, icon: "check_circle" })) },
+    { label: "1 traveler", value: "1 traveler", icon: "person", description: "Solo trip" },
+    { label: "2 travelers", value: "2 travelers", icon: "group", description: "Couple or pair" },
+    { label: "3 travelers", value: "3 travelers", icon: "groups", description: "Small group" },
+    { label: "4 travelers", value: "4 travelers", icon: "groups", description: "Family or group" },
+    { label: "5+ travelers", value: "5+ travelers", icon: "groups", description: "Large group" },
+  ], placeholder: "Enter number & details (e.g. 2 adults, 1 child)" },
+  { key: "interests", prompt: "What activities interest you? You may select as many as you like.", kind: "multi", options: interestOptions },
   { key: "priorityInterests", prompt: "Which of these interests matter most? Select any priorities, or treat them all equally.", kind: "multi", optional: true },
   { key: "pace", prompt: "How would you like your itinerary presented? You can customize the pace, budget, detail level, schedule style, and sections you want included. First, what travel pace feels comfortable?", kind: "single", options: [
     { label: "Relaxed", value: "Relaxed", icon: "spa", description: "Fewer activities and longer rest periods" },
@@ -1514,17 +1744,33 @@ const plannerQuestions: PlannerQuestion[] = [
     { label: "Packed", value: "Packed", icon: "bolt", description: "More activities and shorter breaks" },
   ] },
   { key: "budget", prompt: "What budget level should I use? You can also type a custom amount and currency.", kind: "text", options: [
-    { label: "Budget", value: "Budget", icon: "savings" }, { label: "Moderate", value: "Moderate", icon: "wallet" }, { label: "Premium", value: "Premium", icon: "diamond" },
+    { label: "Budget", value: "Budget", icon: "savings", description: "Affordable spots & local eateries" },
+    { label: "Moderate", value: "Moderate", icon: "wallet", description: "Balanced dining & standard tours" },
+    { label: "Premium", value: "Premium", icon: "diamond", description: "High-end resorts & private tours" },
   ], placeholder: "e.g. PHP 12,000 total" },
   { key: "detail", prompt: "How much detail would you like?", kind: "single", options: [
-    { label: "Quick overview", value: "Quick overview", icon: "view_agenda" }, { label: "Standard itinerary", value: "Standard itinerary", icon: "article" }, { label: "Detailed itinerary", value: "Detailed itinerary", icon: "menu_book" },
+    { label: "Quick overview", value: "Quick overview", icon: "view_agenda", description: "Highlights & main stops" },
+    { label: "Standard itinerary", value: "Standard itinerary", icon: "article", description: "Times, activities & tips" },
+    { label: "Detailed itinerary", value: "Detailed itinerary", icon: "menu_book", description: "In-depth notes & local guide tips" },
   ] },
   { key: "schedule", prompt: "Which schedule style do you prefer?", kind: "single", options: [
-    { label: "Exact suggested times", value: "Exact suggested times", icon: "schedule" }, { label: "Flexible time periods", value: "Flexible time periods", icon: "wb_twilight" }, { label: "Activities only", value: "Activities only, without times", icon: "list" },
+    { label: "Exact suggested times", value: "Exact suggested times", icon: "schedule", description: "Hourly time slots" },
+    { label: "Flexible time periods", value: "Flexible time periods", icon: "wb_twilight", description: "Morning, afternoon & evening blocks" },
+    { label: "Activities only", value: "Activities only, without times", icon: "list", description: "Unscheduled list of recommended stops" },
   ] },
   { key: "sections", prompt: "Which information should I include? Select as many as you like.", kind: "multi", options: sectionOptions.map((value) => ({ label: value, value, icon: "add_task" })), optional: true },
-  { key: "excludedPlaces", prompt: "Are there any places you do not want in the plan? Add one or more names, separated by commas. I will leave out matching attractions and businesses.", kind: "multi", options: [], optional: true, placeholder: "e.g. Cagsawa Ruins, Daraga Church" },
-  { key: "requirements", prompt: "Any special requirements? You can mention mobility, accessibility, dietary needs, ages, language, currency, measurements, or time format.", kind: "text", optional: true, placeholder: "Type requirements, or skip" },
+  { key: "excludedPlaces", prompt: "Are there any places you do not want in the plan?", kind: "multi", options: [
+    { label: "Cagsawa Ruins", value: "Cagsawa Ruins", icon: "block", description: "Already visited" },
+    { label: "Mayon ATV Trail", value: "Mayon ATV Trail", icon: "block", description: "Skip extreme rides" },
+    { label: "Ligñon Hill", value: "Ligñon Hill", icon: "block", description: "Already visited" },
+    { label: "Daraga Church", value: "Daraga Church", icon: "block", description: "Already visited" },
+  ], optional: true, placeholder: "e.g. Cagsawa Ruins, Daraga Church" },
+  { key: "requirements", prompt: "Any special requirements?", kind: "text", options: [
+    { label: "Senior-friendly / Minimal walking", value: "Senior-friendly with minimal walking", icon: "accessible" },
+    { label: "Kid & stroller friendly", value: "Kid and stroller friendly", icon: "child_care" },
+    { label: "Halal / Seafood options", value: "Halal or seafood dietary options", icon: "restaurant_menu" },
+    { label: "Vegetarian food choices", value: "Vegetarian food options", icon: "spa" },
+  ], optional: true, placeholder: "Type requirements, or skip" },
 ];
 
 function createDefaultPlannerAnswers(): PlannerAnswers {
@@ -1565,12 +1811,12 @@ function plannerQuestionPrompt(step: number, answers: PlannerAnswers) {
   if (!question) return "";
   const destination = answers.destination?.trim() || "your destination";
   const days = answers.days ? `${answers.days}-day` : "";
-  const travelers = answers.travelers?.trim() || "your group";
+  const travelers = formatTravelersLabel(answers.travelers);
   const interests = answers.interests ?? [];
   switch (question.key) {
     case "dates": return `When will you visit ${destination}? Choose a trip of up to ${MAX_PLANNER_DAYS} days.`;
     case "days": return `How many days should I plan for ${destination}?`;
-    case "travelers": return `Who is joining this ${days} trip to ${destination}? Include ages when they affect the plan.`;
+    case "travelers": return `Who is joining this ${days} trip to ${destination}? Select a quick option or type specific details.`;
     case "interests": return `What would ${travelers} most enjoy in ${destination}? Select everything that fits.`;
     case "priorityInterests": return `You chose ${interests.length} interests. Which should get the most time in the itinerary?`;
     case "pace": return `What pace would feel comfortable for ${travelers}?`;
@@ -1611,7 +1857,7 @@ function plannerAcknowledgement(key: PlannerAnswerKey, answers: PlannerAnswers) 
     case "destination": return `${answers.destination || "That destination"} sounds good.`;
     case "dates": return `Perfect - I matched those dates to a ${answers.days}-day plan.`;
     case "days": return `Got it - I will plan ${answers.days} day${answers.days === "1" ? "" : "s"}.`;
-    case "travelers": return `I will shape the plan around ${answers.travelers || "your group"}.`;
+    case "travelers": return `I will shape the plan around ${formatTravelersLabel(answers.travelers)}.`;
     case "interests": return answers.interests?.length === 1
       ? `${answers.interests[0]} will be the main theme.`
       : `Nice mix - I will balance ${answers.interests?.length ?? 0} interests.`;
@@ -1766,24 +2012,206 @@ function buildItinerary(answers: PlannerAnswers, registeredBusinesses: Registere
   }));
 }
 
-function ItineraryPreview({ itinerary, compact = false, onExclude }: { itinerary: ItineraryDay[]; compact?: boolean; onExclude?: (title: string) => void }) {
+function ItineraryPreview({
+  itinerary,
+  compact = false,
+  onExclude,
+  onReplaceStop,
+  budgetText,
+}: {
+  itinerary: ItineraryDay[];
+  compact?: boolean;
+  onExclude?: (title: string) => void;
+  onReplaceStop?: (day: number, stopIndex: number, currentTitle: string) => void;
+  budgetText?: string | number | null;
+}) {
+  const registeredBizNames = useMemo(() => {
+    const bizList = readRegisteredSmallBusinesses();
+    return new Set(bizList.map((biz) => biz.name.toLowerCase().trim()));
+  }, []);
+
+  const formattedBudget = useMemo(() => {
+    if (!budgetText) return "Moderate (₱700–₱1,500 / person)";
+    if (typeof budgetText === "number") return `₱${budgetText.toLocaleString()} Total Budget`;
+    if (budgetText === "Budget") return "₱300–₱700 per person / day (Budget)";
+    if (budgetText === "Moderate") return "₱700–₱1,500 per person / day (Moderate)";
+    if (budgetText === "Premium") return "₱1,500+ per person / day (Premium)";
+    return budgetText;
+  }, [budgetText]);
+
   return (
     <div className={`itinerary-preview ${compact ? "itinerary-preview-compact" : ""}`}>
+      {!compact && (
+        <div className="itinerary-budget-banner">
+          <div className="itinerary-budget-icon">
+            <Icon name="account_balance_wallet" size={20} color="white" />
+          </div>
+          <div className="itinerary-budget-copy">
+            <span className="itinerary-budget-label">Trip Budget</span>
+            <strong>{formattedBudget}</strong>
+          </div>
+        </div>
+      )}
       {itinerary.map((day) => (
         <div className="itinerary-day" key={day.day}>
           <div className="itinerary-day-heading"><span>Day {day.day}</span><strong>{day.title}</strong></div>
           <div className="itinerary-timeline">
-            {day.stops.map((stop) => (
-              <div className="itinerary-stop" key={`${day.day}-${stop.time}-${stop.title}`}>
-                <div className="itinerary-stop-icon"><Icon name={stop.icon} size={17} color="var(--c-green)" /></div>
-                <div className="itinerary-stop-copy">{stop.time && <span>{stop.time}</span>}<strong>{stop.title}</strong>{!compact && <p>{stop.note}</p>}{onExclude && <button type="button" className="itinerary-exclude" onClick={() => onExclude(stop.title)}><Icon name="remove_circle" size={15} /> Remove from my plan</button>}</div>
-              </div>
-            ))}
+            {day.stops.map((stop, stopIndex) => {
+              const isBiz = registeredBizNames.has(stop.title.toLowerCase().trim()) || stop.note.includes("registered Hilinga small business");
+              const priceMatch = stop.note.match(/₱[\d,]+(?:–₱[\d,]+|\+)?(?:\s*per\s*person)?/i);
+              return (
+                <div className="itinerary-stop" key={`${day.day}-${stopIndex}-${stop.title}`}>
+                  <div className="itinerary-stop-icon"><Icon name={stop.icon} size={17} color="var(--c-green)" /></div>
+                  <div className="itinerary-stop-copy">
+                    {stop.time && <span>{stop.time}</span>}
+                    {isBiz && (
+                      <span className="itinerary-business-badge">
+                        <Icon name="verified" size={13} color="var(--c-green)" filled /> Registered Local Business
+                      </span>
+                    )}
+                    <strong>{stop.title}</strong>
+                    {!compact && <p>{stop.note}</p>}
+                    {priceMatch && (
+                      <span className="stop-price-tag">
+                        <Icon name="sell" size={13} color="var(--c-green)" /> Estimated: {priceMatch[0]}
+                      </span>
+                    )}
+                    {(onReplaceStop || onExclude) && (
+                      <div className="itinerary-actions-row">
+                        {onReplaceStop && (
+                          <button type="button" className="itinerary-replace-btn" onClick={() => onReplaceStop(day.day, stopIndex, stop.title)}>
+                            <Icon name="swap_horiz" size={15} /> Replace place
+                          </button>
+                        )}
+                        {onExclude && (
+                          <button type="button" className="itinerary-exclude" onClick={() => onExclude(stop.title)}>
+                            <Icon name="remove_circle" size={15} /> Remove
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
       ))}
       {!compact && <p className="itinerary-note"><Icon name="info" size={16} /> Suggested times are flexible. Check weather, opening hours, and local transport before leaving.</p>}
     </div>
+  );
+}
+
+function ReplacePlaceModal({
+  visible,
+  target,
+  onClose,
+  onSelectReplacement,
+}: {
+  visible: boolean;
+  target: { day: number; stopIndex: number; currentTitle: string } | null;
+  onClose: () => void;
+  onSelectReplacement: (newTitle: string) => void;
+}) {
+  const [customInput, setCustomInput] = useState("");
+  const registeredBusinesses = useMemo(() => readRegisteredSmallBusinesses(), [visible]);
+  const defaultSuggestions = useMemo(() => [
+    { title: "Cagsawa Ruins", category: "Historic Site", location: "Daraga, Albay", icon: "account_balance" },
+    { title: "Mayon ATV Trail", category: "Adventure", location: "Mayon Foothills", icon: "sports_motorsports" },
+    { title: "Sumlang Lake", category: "Nature & Views", location: "Camalig, Albay", icon: "water_drop" },
+    { title: "Mayon Skyline & Park", category: "Nature & Views", location: "Tabaco City, Albay", icon: "landscape" },
+    { title: "Daraga Church & Viewpoint", category: "Culture & History", location: "Daraga, Albay", icon: "church" },
+    { title: "Legazpi Boulevard & Port", category: "Dining & Sunset", location: "Legazpi City", icon: "beach_access" },
+    { title: "Quitinday Hills & Cave", category: "Hiking & Gems", location: "Camalig, Albay", icon: "explore" },
+    { title: "Vera Falls", category: "Nature & Waterfalls", location: "Malinao, Albay", icon: "water_drop" },
+  ], []);
+
+  if (!visible || !target) return null;
+
+  return (
+    <AppModal visible={visible} title={`Replace "${target.currentTitle}"`} onClose={onClose}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+        <p style={{ color: "var(--c-body)", fontSize: 13 }}>Choose a registered local business or popular Albay spot to replace <strong>"{target.currentTitle}"</strong> in your plan:</p>
+
+        {registeredBusinesses.length > 0 && (
+          <div>
+            <span className="eyebrow" style={{ marginBottom: 6, display: "block" }}>Registered Small Businesses</span>
+            <div className="replace-option-grid">
+              {registeredBusinesses.map((biz) => (
+                <button
+                  key={biz.name}
+                  type="button"
+                  className="replace-option-card"
+                  onClick={() => { onSelectReplacement(biz.name); onClose(); }}
+                >
+                  <div style={{ width: 36, height: 36, borderRadius: 12, background: "var(--c-pale)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                    <Icon name="storefront" size={20} color="var(--c-green)" />
+                  </div>
+                  <div className="replace-option-info">
+                    <strong>{biz.name} <small style={{ color: "var(--c-green)", fontWeight: 800 }}>• Registered</small></strong>
+                    <span>{biz.category} in {biz.location}</span>
+                  </div>
+                  <Icon name="chevron_right" size={18} color="var(--c-muted)" />
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div>
+          <span className="eyebrow" style={{ marginBottom: 6, display: "block", marginTop: 8 }}>Albay Popular Destinations</span>
+          <div className="replace-option-grid">
+            {defaultSuggestions.filter((item) => item.title.toLowerCase() !== target.currentTitle.toLowerCase()).map((item) => (
+              <button
+                key={item.title}
+                type="button"
+                className="replace-option-card"
+                onClick={() => { onSelectReplacement(item.title); onClose(); }}
+              >
+                <div style={{ width: 36, height: 36, borderRadius: 12, background: "var(--c-pale)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                  <Icon name={item.icon} size={20} color="var(--c-green)" />
+                </div>
+                <div className="replace-option-info">
+                  <strong>{item.title}</strong>
+                  <span>{item.category} • {item.location}</span>
+                </div>
+                <Icon name="chevron_right" size={18} color="var(--c-muted)" />
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <form
+          className="replace-custom-box"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (customInput.trim()) {
+              onSelectReplacement(customInput.trim());
+              setCustomInput("");
+              onClose();
+            }
+          }}
+        >
+          <span className="eyebrow">Or type any custom place name</span>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              type="text"
+              value={customInput}
+              onChange={(e) => setCustomInput(e.target.value)}
+              placeholder="e.g. Jovellar Underground River"
+              style={{ flex: 1, height: 42, border: "1px solid var(--c-line)", borderRadius: 13, padding: "0 12px" }}
+            />
+            <button
+              type="submit"
+              disabled={!customInput.trim()}
+              style={{ padding: "0 16px", borderRadius: 13, background: "var(--c-green)", color: "white", fontWeight: 800, border: 0 }}
+            >
+              Replace
+            </button>
+          </div>
+        </form>
+      </div>
+    </AppModal>
   );
 }
 
@@ -1808,16 +2236,25 @@ function Planner({ onOpenMap }: { onOpenMap: (planId: string) => void }) {
   const [chatOpen, setChatOpen] = useState(false);
   const [chatStep, setChatStep] = useState(0);
   const [chatInput, setChatInput] = useState("");
+  const chatInputRef = useRef<HTMLInputElement>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
   const [travelStartDate, setTravelStartDate] = useState("");
   const [travelEndDate, setTravelEndDate] = useState("");
   const [answers, setAnswers] = useState<PlannerAnswers>(createDefaultPlannerAnswers);
   const [messages, setMessages] = useState<PlannerMessage[]>([]);
   const [generated, setGenerated] = useState<ItineraryDay[] | null>(null);
+  const [generatingItinerary, setGeneratingItinerary] = useState(false);
+  const [chatReplaceTarget, setChatReplaceTarget] = useState<{ day: number; stopIndex: number; currentTitle: string } | null>(null);
   const [registeredBusinesses, setRegisteredBusinesses] = useState<RegisteredSmallBusiness[]>(() => readRegisteredSmallBusinesses());
   const [savingGenerated, setSavingGenerated] = useState(false);
   const [expandedPlan, setExpandedPlan] = useState<string | null>(null);
   const load = useCallback(async () => { setLoading(true); setLoadError(null); try { if (user) setPlans(await getTripPlans(db, user.uid)); } catch { setLoadError("Trip plans could not be loaded."); } finally { setLoading(false); } }, [db, user]);
   useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    if (chatOpen) {
+      chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [chatStep, messages.length, chatOpen]);
   useEffect(() => {
     const refreshBusinesses = () => setRegisteredBusinesses(readRegisteredSmallBusinesses());
     window.addEventListener(BUSINESS_CONTENT_CHANGED_EVENT, refreshBusinesses);
@@ -1864,6 +2301,7 @@ function Planner({ onOpenMap }: { onOpenMap: (planId: string) => void }) {
     setTravelEndDate("");
     setAnswers(freshAnswers);
     setGenerated(null);
+    setGeneratingItinerary(false);
     setMessages([{ id: Date.now(), role: "guide", text: `Hi! I’m your Hilinga guide. I’ll adapt each question to your answers. ${plannerQuestionPrompt(0, freshAnswers)}` }]);
     setChatOpen(true);
   }
@@ -1973,6 +2411,25 @@ function Planner({ onOpenMap }: { onOpenMap: (planId: string) => void }) {
     setChatInput("");
   }
 
+  function submitChatInput() {
+    const question = plannerQuestions[chatStep];
+    const value = chatInput.trim();
+    if (!question || (question.kind !== "text" && question.kind !== "multi")) return;
+    if (!value) {
+      if (question.kind === "multi") {
+        const selected = (answers[question.key] as string[] | undefined) ?? [];
+        if (question.optional || selected.length > 0) {
+          finishMultiQuestion();
+          return;
+        }
+      }
+      chatInputRef.current?.focus();
+      return;
+    }
+    if (question.kind === "multi") addCustomMultiAnswer();
+    else answerQuestion(value);
+  }
+
   function editPreferences() {
     setGenerated(null);
     setChatStep(0);
@@ -2005,9 +2462,23 @@ function Planner({ onOpenMap }: { onOpenMap: (planId: string) => void }) {
     } finally { setSavingGenerated(false); }
   }
 
-  function generateItinerary() {
-    setGenerated(buildItinerary(answers, registeredBusinesses));
-    setMessages((current) => [...current, { id: Date.now(), role: "user", text: "Generate my itinerary" }, { id: Date.now() + 1, role: "guide", text: "Your personalized itinerary is ready. You can still change any preference and regenerate it." }]);
+  async function generateItinerary() {
+    if (generatingItinerary) return;
+    setGeneratingItinerary(true);
+    setMessages((current) => [...current, { id: Date.now(), role: "user", text: "Generate my itinerary" }, { id: Date.now() + 1, role: "guide", text: "I’m turning your answers into a personalized Albay itinerary now…" }]);
+    try {
+      const itinerary = await generateAiItinerary({
+        answers,
+        localBusinesses: registeredBusinesses.map(({ name, category, location, hours, about }) => ({ name, category, location, hours, about })),
+      });
+      setGenerated(itinerary);
+      setMessages((current) => [...current, { id: Date.now() + 2, role: "guide", text: "Your AI-personalized itinerary is ready. You can remove a stop, change your preferences, or regenerate it." }]);
+    } catch {
+      setGenerated(buildItinerary(answers, registeredBusinesses));
+      setMessages((current) => [...current, { id: Date.now() + 2, role: "guide", text: "I created your itinerary with Hilinga’s built-in local planner because the AI service is not available right now. You can still edit and save it normally." }]);
+    } finally {
+      setGeneratingItinerary(false);
+    }
   }
 
   function excludeGeneratedPlace(title: string) {
@@ -2016,6 +2487,28 @@ function Planner({ onOpenMap }: { onOpenMap: (planId: string) => void }) {
     setAnswers(nextAnswers);
     setGenerated(buildItinerary(nextAnswers, registeredBusinesses));
     setMessages((current) => [...current, { id: Date.now(), role: "user", text: `Remove ${title}` }, { id: Date.now() + 1, role: "guide", text: `Done. I removed ${title} and rebuilt the plan without it.` }]);
+  }
+
+  function replaceGeneratedPlace(day: number, stopIndex: number, newTitle: string) {
+    if (!generated) return;
+    const updated = generated.map((dayPlan) => {
+      if (dayPlan.day !== day) return dayPlan;
+      const newStops = [...dayPlan.stops];
+      if (newStops[stopIndex]) {
+        newStops[stopIndex] = {
+          ...newStops[stopIndex],
+          title: newTitle,
+          note: `Customized stop: ${newTitle}.`,
+        };
+      }
+      return { ...dayPlan, stops: newStops };
+    });
+    setGenerated(updated);
+    setMessages((current) => [
+      ...current,
+      { id: Date.now(), role: "user", text: `Replace stop ${stopIndex + 1} with ${newTitle}` },
+      { id: Date.now() + 1, role: "guide", text: `I updated Day ${day}, Stop ${stopIndex + 1} to "${newTitle}".` },
+    ]);
   }
 
   const currentQuestion = plannerQuestions[chatStep];
@@ -2073,7 +2566,13 @@ function Planner({ onOpenMap }: { onOpenMap: (planId: string) => void }) {
               <div className="title-row">
                 <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
                   <span className="planner-plan-title">{plan.title}</span>
-                  <span style={{ color: "var(--c-body)" }}>{plan.preferences.durationHours} hours{plan.preferences.budget !== null ? ` · PHP ${plan.preferences.budget.toLocaleString()}` : ""}</span>
+                  <div className="plan-meta-row">
+                    <span className="plan-tag-chip"><Icon name="schedule" size={14} /> {plan.preferences.durationHours} hours</span>
+                    <span className="plan-budget-chip">
+                      <Icon name="payments" size={15} color="var(--c-green)" />
+                      <strong>{plan.preferences.budget !== null ? `₱${plan.preferences.budget.toLocaleString()} Total Budget` : "Moderate Budget"}</strong>
+                    </span>
+                  </div>
                 </div>
                 <button aria-label={`Delete ${plan.title}`} onClick={() => setDeleteTarget(plan)} style={{ padding: 8, background: "none", border: "none", cursor: "pointer" }}>
                   <Icon name="delete" size={21} color="var(--c-red)" />
@@ -2089,7 +2588,7 @@ function Planner({ onOpenMap }: { onOpenMap: (planId: string) => void }) {
                   <button className="planner-view-btn" onClick={() => setExpandedPlan(expandedPlan === plan.id ? null : plan.id)}>
                     {expandedPlan === plan.id ? "Hide itinerary" : "View itinerary"}<Icon name={expandedPlan === plan.id ? "expand_less" : "expand_more"} size={20} />
                   </button>
-                  {expandedPlan === plan.id && <ItineraryPreview itinerary={plan.itinerary} compact />}
+                  {expandedPlan === plan.id && <ItineraryPreview itinerary={plan.itinerary} budgetText={plan.preferences.budget} compact />}
                 </>
               )}
             </Card>
@@ -2111,7 +2610,12 @@ function Planner({ onOpenMap }: { onOpenMap: (planId: string) => void }) {
         {generated ? (
           <div className="planner-result">
             <div className="planner-result-heading"><div><span className="eyebrow">Made for you</span><h3>Your {generated.length}-day {answers.destination ?? "Albay"} itinerary</h3></div><Icon name="verified" size={25} color="var(--c-green)" filled /></div>
-            <ItineraryPreview itinerary={generated} onExclude={excludeGeneratedPlace} />
+            <ItineraryPreview
+              itinerary={generated}
+              budgetText={answers.budget}
+              onExclude={excludeGeneratedPlace}
+              onReplaceStop={(day, stopIndex, currentTitle) => setChatReplaceTarget({ day, stopIndex, currentTitle })}
+            />
             <Button label="Save & view route on map" onPress={saveGeneratedPlan} loading={savingGenerated} />
             <button className="planner-restart" onClick={editPreferences} disabled={savingGenerated}>Change preferences</button>
             <button className="planner-restart" onClick={openChat} disabled={savingGenerated}>Start over</button>
@@ -2126,7 +2630,12 @@ function Planner({ onOpenMap }: { onOpenMap: (planId: string) => void }) {
               <div><dt>Selected interests</dt><dd>{answers.interests?.join(", ") || "Local highlights"}</dd></div>
               <div><dt>Priority interests</dt><dd>{answers.priorityInterests?.join(", ") || "All selected equally"}</dd></div>
               <div><dt>Travel pace</dt><dd>{answers.pace ?? "Balanced"}</dd></div>
-              <div><dt>Budget and currency</dt><dd>{answers.budget && ["Budget", "Moderate", "Premium"].includes(answers.budget) ? `${answers.budget} (PHP)` : answers.budget ?? "Moderate (PHP)"}</dd></div>
+              <div className="planner-summary-budget-row">
+                <dt><Icon name="payments" size={18} color="var(--c-green)" /> Budget & Currency</dt>
+                <dd className="planner-summary-budget-badge">
+                  {answers.budget && ["Budget", "Moderate", "Premium"].includes(answers.budget) ? `${answers.budget} (PHP)` : answers.budget ?? "Moderate (PHP)"}
+                </dd>
+              </div>
               <div><dt>Detail level</dt><dd>{answers.detail ?? "Standard itinerary"}</dd></div>
               <div><dt>Schedule style</dt><dd>{answers.schedule ?? "Flexible time periods"}</dd></div>
               <div><dt>Included sections</dt><dd>{answers.sections?.join(", ") || "None"}</dd></div>
@@ -2134,12 +2643,18 @@ function Planner({ onOpenMap }: { onOpenMap: (planId: string) => void }) {
               <div><dt>Local businesses</dt><dd>{registeredBusinesses.length ? `${registeredBusinesses.length} registered small business${registeredBusinesses.length === 1 ? "" : "es"} considered` : "No registered small businesses found"}</dd></div>
               <div><dt>Special requirements</dt><dd>{answers.requirements || "None provided"}</dd></div>
             </dl>
-            <Button label="Generate itinerary" onPress={generateItinerary} />
-            <button className="planner-restart" onClick={editPreferences}>Change preferences</button>
+            <Button label={generatingItinerary ? "Creating your itinerary…" : "Generate with AI"} onPress={() => void generateItinerary()} loading={generatingItinerary} disabled={generatingItinerary} />
+            <button className="planner-restart" onClick={editPreferences} disabled={generatingItinerary}>Change preferences</button>
           </div>
         ) : (
           <>
-            <div className={`planner-replies ${currentQuestion?.kind === "multi" ? "planner-replies-multi" : ""}`}>
+            {currentQuestion?.key === "interests" && (
+              <div className="planner-option-heading">
+                <span>Choose one or more</span>
+                <small>{currentMultiValues.length ? `${currentMultiValues.length} selected` : "Tap every option that fits"}</small>
+              </div>
+            )}
+            <div className={`planner-replies ${currentQuestion?.kind === "multi" ? "planner-replies-multi" : ""} ${currentQuestion?.key === "interests" ? "planner-replies-interests" : ""}`}>
               {currentOptions.map((option) => {
                 const selected = currentQuestion?.kind === "multi"
                   ? currentMultiValues.includes(option.value)
@@ -2204,17 +2719,26 @@ function Planner({ onOpenMap }: { onOpenMap: (planId: string) => void }) {
               </form>
             )}
             {(currentQuestion?.kind === "text" || currentQuestion?.kind === "multi") && (
-              <form className="planner-chat-input" onSubmit={(event) => { event.preventDefault(); if (chatInput.trim()) currentQuestion.kind === "multi" ? addCustomMultiAnswer() : answerQuestion(chatInput.trim()); }}>
-                <input value={chatInput} onChange={(event) => setChatInput(event.target.value)} placeholder={currentQuestion.placeholder ?? (currentQuestion.kind === "multi" ? "Add another interest or preference" : "Type your answer…")} aria-label="Type your answer" />
-                <button type="submit" disabled={!chatInput.trim()} aria-label="Send answer"><Icon name={currentQuestion.kind === "multi" ? "add" : "arrow_upward"} size={20} color="white" /></button>
+              <form className="planner-chat-input" onSubmit={(event) => { event.preventDefault(); submitChatInput(); }}>
+                <input ref={chatInputRef} value={chatInput} onChange={(event) => setChatInput(event.target.value)} placeholder={currentQuestion.placeholder ?? (currentQuestion.kind === "multi" ? "Add another interest or preference" : "Type your answer…")} aria-label="Type your answer" />
+                <button type="submit" aria-label={currentQuestion.kind === "multi" ? "Add typed preference" : "Send answer"}><Icon name={currentQuestion.kind === "multi" ? "add" : "arrow_upward"} size={20} color="white" /></button>
               </form>
             )}
             {currentQuestion?.kind === "text" && currentQuestion.optional && (
               <button className="planner-skip" onClick={() => answerQuestion("", "No special requirements")}>Skip this question</button>
             )}
             {chatStep > 0 && <button className="planner-back" type="button" onClick={previousQuestion}><Icon name="arrow_back" size={16} /> Back to previous question</button>}
+            <div ref={chatEndRef} />
           </>
         )}
+        <ReplacePlaceModal
+          visible={chatReplaceTarget !== null}
+          target={chatReplaceTarget}
+          onClose={() => setChatReplaceTarget(null)}
+          onSelectReplacement={(newTitle) => {
+            if (chatReplaceTarget) replaceGeneratedPlace(chatReplaceTarget.day, chatReplaceTarget.stopIndex, newTitle);
+          }}
+        />
       </AppModal>
       <AppModal visible={formOpen} title="New trip plan" onClose={() => !submitting && setFormOpen(false)}>
         <Field label="Trip name" value={title} onChangeText={setTitle} placeholder="e.g. Weekend in Legazpi" error={errors.title} />

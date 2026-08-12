@@ -376,3 +376,28 @@ export async function deleteTripPlan(db: IDBDatabase, userId: string, id: string
     deferCloudSync(error, "[cloud-user-data] Trip-plan removal queued for sync.");
   }
 }
+
+export async function updateTripPlan(
+  db: IDBDatabase,
+  userId: string,
+  id: string,
+  updates: Partial<Pick<TripPlan, "title" | "preferences" | "itinerary">>,
+) {
+  await migrateLegacyData(db, userId);
+  const existing = (await userRows<CachedTripPlan>(db, TRIPS_STORE, userId))
+    .find((plan) => plan.id === id);
+  if (!existing) return;
+  const now = new Date().toISOString();
+  const row: CachedTripPlan = {
+    ...existing,
+    ...updates,
+    updatedAt: now,
+    syncState: "pending",
+  };
+  await putRow(db, TRIPS_STORE, row);
+  try {
+    await flushTripRow(db, row);
+  } catch (error) {
+    deferCloudSync(error, "[cloud-user-data] Trip-plan update queued for sync.");
+  }
+}

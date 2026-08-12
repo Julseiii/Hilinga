@@ -2,6 +2,7 @@ import "leaflet/dist/leaflet.css";
 
 import type { Map as LeafletMap } from "leaflet";
 import { useEffect, useRef } from "react";
+import type { RegisteredSmallBusiness } from "@/lib/business-content";
 
 export type MapPlace = {
   id: string;
@@ -35,77 +36,203 @@ type OpenStreetMapProps = {
   destination?: MapPlace | null;
   routeGeometry?: readonly [number, number][];
   onMapPress?: (place: MapPlace) => void;
+  registeredBusinesses?: readonly RegisteredSmallBusiness[];
+  showTransportRoutes?: boolean;
+  showRegisteredBusinesses?: boolean;
 };
 
 const LEGAZPI = { latitude: 13.1333, longitude: 123.7333 };
+
+export const ALBAY_TRANSPORT_TERMINALS: MapTerminal[] = [
+  { id: "terminal-legazpi", name: "Ibalong Grand Central Terminal", subtitle: "Main Legazpi bus, UV & jeepney hub", latitude: 13.1437, longitude: 123.7435, transport: "Jeepney, UV Express, Bus, Tricycle" },
+  { id: "terminal-daraga", name: "Daraga Public Market Terminal", subtitle: "Daraga jeepney & tricycle hub", latitude: 13.1470, longitude: 123.7117, transport: "Daraga Jeepney, Tricycle" },
+  { id: "terminal-camalig", name: "Camalig Town Transport Hub", subtitle: "West Albay jeepney stop", latitude: 13.1481, longitude: 123.6602, transport: "Jeepney, Tricycle" },
+  { id: "terminal-guinobatan", name: "Guinobatan Central Stop", subtitle: "Guinobatan highway stop", latitude: 13.1903, longitude: 123.6010, transport: "Jeepney, Bus, UV Express" },
+  { id: "terminal-ligao", name: "Ligao City Transport Terminal", subtitle: "West Albay central terminal", latitude: 13.2411, longitude: 123.5358, transport: "UV Express, Jeepney, Bus" },
+  { id: "terminal-tabaco", name: "Tabaco City Central Terminal", subtitle: "North Albay bus, UV & ferry hub", latitude: 13.3590, longitude: 123.7300, transport: "UV Express, Jeepney, Bus, Ferry" },
+  { id: "terminal-bacacay", name: "Bacacay Town Transport Stop", subtitle: "East coast jeepney terminal", latitude: 13.2927, longitude: 123.7914, transport: "Jeepney, Tricycle, Boat" },
+];
+
+export const ALBAY_TRANSPORT_ROUTES = [
+  {
+    name: "Legazpi – Daraga Jeepney Route",
+    type: "Jeepney",
+    color: "#F59E0B",
+    path: [
+      [13.1437, 123.7435],
+      [13.1391, 123.7438],
+      [13.1417, 123.7150],
+      [13.1470, 123.7117],
+    ] as [number, number][],
+  },
+  {
+    name: "West Albay Route (Legazpi – Camalig – Ligao)",
+    type: "Bus / Jeepney / UV Express",
+    color: "#3B82F6",
+    path: [
+      [13.1437, 123.7435],
+      [13.1470, 123.7117],
+      [13.1481, 123.6602],
+      [13.1903, 123.6010],
+      [13.2411, 123.5358],
+    ] as [number, number][],
+  },
+  {
+    name: "North Albay Route (Legazpi – Sto. Domingo – Tabaco)",
+    type: "UV Express / Bus",
+    color: "#8B5CF6",
+    path: [
+      [13.1437, 123.7435],
+      [13.2356, 123.7744],
+      [13.3150, 123.7380],
+      [13.3590, 123.7300],
+    ] as [number, number][],
+  },
+  {
+    name: "Tabaco – Bacacay Coastal Route",
+    type: "Jeepney",
+    color: "#10B981",
+    path: [
+      [13.3590, 123.7300],
+      [13.2927, 123.7914],
+    ] as [number, number][],
+  },
+];
 
 function escapeHtml(value: string) {
   return value.replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[character] ?? character);
 }
 
-export function OpenStreetMap({ places, routeStops = [], selectedId, onSelect, liveLocation = null, startPoint = null, destination = null, routeGeometry = [], onMapPress }: OpenStreetMapProps) {
+export function OpenStreetMap({
+  places,
+  routeStops = [],
+  selectedId,
+  onSelect,
+  liveLocation = null,
+  startPoint = null,
+  destination = null,
+  routeGeometry = [],
+  onMapPress,
+  registeredBusinesses = [],
+  showTransportRoutes = true,
+  showRegisteredBusinesses = true,
+}: OpenStreetMapProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<LeafletMap | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
-
-    async function initializeMap() {
+    let active = true;
+    async function setupMap() {
+      const container = hostRef.current;
+      if (!container) return;
       const L = await import("leaflet");
-      const host = hostRef.current;
-      if (!host || cancelled || mapRef.current) return;
+      if (!active) return;
 
-      const map = L.map(host, { zoomControl: true }).setView([LEGAZPI.latitude, LEGAZPI.longitude], 12);
-      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
+      if (mapRef.current) {
+        mapRef.current.remove();
+        mapRef.current = null;
+      }
+
+      const center: [number, number] = liveLocation
+        ? [liveLocation.latitude, liveLocation.longitude]
+        : startPoint
+          ? [startPoint.latitude, startPoint.longitude]
+          : destination
+            ? [destination.latitude, destination.longitude]
+            : [LEGAZPI.latitude, LEGAZPI.longitude];
+
+      const map = L.map(container, { zoomControl: false }).setView(center, 12);
+      L.control.zoom({ position: "bottomright" }).addTo(map);
+
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
         maxZoom: 19,
       }).addTo(map);
 
       if (onMapPress) {
-        map.on("click", ({ latlng, originalEvent }) => {
-          const target = originalEvent.target;
-          if (target instanceof Element && target.closest(".leaflet-interactive, .leaflet-control")) return;
+        map.on("click", (event) => {
+          const { lat, lng } = event.latlng;
           onMapPress({
-            id: "dropped-pin",
-            name: "Dropped pin",
-            subtitle: `${latlng.lat.toFixed(5)}, ${latlng.lng.toFixed(5)}`,
-            latitude: latlng.lat,
-            longitude: latlng.lng,
+            id: `pin-${Date.now()}`,
+            name: "Selected location",
+            subtitle: `${lat.toFixed(4)}, ${lng.toFixed(4)}`,
+            latitude: lat,
+            longitude: lng,
           });
         });
       }
 
-      L.circleMarker([LEGAZPI.latitude, LEGAZPI.longitude], {
-        color: "#FFFFFF",
-        fillColor: "#007A50",
-        fillOpacity: 1,
-        radius: 8,
-        weight: 3,
-      }).bindPopup("<strong>Legazpi City</strong><br>Default map location").addTo(map);
+      // ── Transportation Routes & Hub Terminals ──
+      if (showTransportRoutes) {
+        ALBAY_TRANSPORT_ROUTES.forEach((route) => {
+          L.polyline(route.path, {
+            color: route.color,
+            weight: 4,
+            opacity: 0.75,
+            dashArray: "8 6",
+          }).bindTooltip(`${escapeHtml(route.name)} (${escapeHtml(route.type)})`, { permanent: false, direction: "top" }).addTo(map);
+        });
+
+        ALBAY_TRANSPORT_TERMINALS.forEach((terminal) => {
+          const marker = L.circleMarker([terminal.latitude, terminal.longitude], {
+            color: "#FFFFFF",
+            fillColor: "#D97706",
+            fillOpacity: 1,
+            radius: 9,
+            weight: 3,
+          });
+          marker.bindPopup(`<strong>🚌 ${escapeHtml(terminal.name)}</strong><br/><span style="color:#D97706;font-weight:800;font-size:11px;">Transport Hub</span><br/><strong>Vehicles:</strong> ${escapeHtml(terminal.transport)}<br/>${escapeHtml(terminal.subtitle)}`);
+          marker.addTo(map);
+        });
+      }
+
+      // ── Registered Small Businesses Layer ──
+      if (showRegisteredBusinesses && registeredBusinesses.length > 0) {
+        registeredBusinesses.forEach((biz) => {
+          const marker = L.circleMarker([biz.latitude, biz.longitude], {
+            color: "#FFFFFF",
+            fillColor: "#00A86B",
+            fillOpacity: 1,
+            radius: 10,
+            weight: 3,
+          });
+          marker.bindTooltip(`🏪 ${escapeHtml(biz.name)}`, { permanent: false, direction: "top" });
+          marker.bindPopup(`
+            <div style="min-width: 170px; display: flex; flex-direction: column; gap: 3px;">
+              <span style="color:#00A86B; font-weight:800; font-size:11px; letter-spacing:0.3px;">✓ REGISTERED LOCAL BUSINESS</span>
+              <strong style="font-size:14px; color:#101828;">${escapeHtml(biz.name)}</strong>
+              <span style="font-size:12px; color:#475467;">${escapeHtml(biz.category)} • ${escapeHtml(biz.location)}</span>
+              <div style="margin-top:4px; font-size:11px; color:#344054; line-height:1.4;">${escapeHtml(biz.about)}</div>
+              <div style="margin-top:4px; font-size:10px; color:#00A86B; font-weight:800;">Hours: ${escapeHtml(biz.hours)}</div>
+            </div>
+          `);
+          marker.addTo(map);
+        });
+      }
 
       if (liveLocation) {
-        L.circle([liveLocation.latitude, liveLocation.longitude], {
-          color: "#2563EB",
-          fillColor: "#60A5FA",
-          fillOpacity: 0.12,
-          radius: liveLocation.accuracy,
-          weight: 1,
-        }).addTo(map);
         L.circleMarker([liveLocation.latitude, liveLocation.longitude], {
           color: "#FFFFFF",
-          fillColor: "#2563EB",
+          fillColor: "#007A50",
           fillOpacity: 1,
           radius: 9,
-          weight: 4,
-        }).bindPopup(`<strong>Your live location</strong><br>Accurate to about ${Math.round(liveLocation.accuracy)} m`).addTo(map);
+          weight: 3,
+        }).bindPopup("<strong>Your live location</strong><br>Updating as you move").addTo(map);
+        L.circle([liveLocation.latitude, liveLocation.longitude], {
+          radius: liveLocation.accuracy,
+          color: "#007A50",
+          weight: 1,
+          fillColor: "#007A50",
+          fillOpacity: 0.12,
+        }).addTo(map);
       }
 
       if (startPoint) {
         L.circleMarker([startPoint.latitude, startPoint.longitude], {
           color: "#FFFFFF",
-          fillColor: "#007A50",
+          fillColor: "#0F766E",
           fillOpacity: 1,
-          radius: 10,
+          radius: 9,
           weight: 3,
         }).bindPopup(`<strong>Start: ${escapeHtml(startPoint.name)}</strong><br>${escapeHtml(startPoint.subtitle)}`).addTo(map);
       }
@@ -115,28 +242,19 @@ export function OpenStreetMap({ places, routeStops = [], selectedId, onSelect, l
           color: "#FFFFFF",
           fillColor: "#B42318",
           fillOpacity: 1,
-          radius: 10,
+          radius: 9,
           weight: 3,
         }).bindPopup(`<strong>Destination: ${escapeHtml(destination.name)}</strong><br>${escapeHtml(destination.subtitle)}`).addTo(map);
       }
 
       if (startPoint && destination) {
-        const pointToPointBounds = L.latLngBounds([
+        const bounds = L.latLngBounds([
           [startPoint.latitude, startPoint.longitude],
           [destination.latitude, destination.longitude],
         ]);
-        const path = routeGeometry.length > 1
-          ? [...routeGeometry]
-          : [[startPoint.latitude, startPoint.longitude], [destination.latitude, destination.longitude]] as [number, number][];
-        L.polyline(path, {
-          color: "#007A50",
-          weight: 6,
-          opacity: 0.88,
-          dashArray: routeGeometry.length > 1 ? undefined : "10 8",
-        }).bindTooltip(routeGeometry.length > 1 ? "Road route" : "Estimated direct route").addTo(map);
-        map.fitBounds(pointToPointBounds, { padding: [42, 42], maxZoom: 14 });
-      } else if (liveLocation) {
-        map.setView([liveLocation.latitude, liveLocation.longitude], 16);
+        const path = routeGeometry.length > 0 ? [...routeGeometry] : [[startPoint.latitude, startPoint.longitude], [destination.latitude, destination.longitude]] as [number, number][];
+        L.polyline(path, { color: "#007A50", weight: 6, opacity: 0.8 }).addTo(map);
+        map.fitBounds(bounds, { padding: [50, 50] });
       }
 
       const routeStopIds = new Set(routeStops.map((stop) => stop.id));
@@ -153,7 +271,7 @@ export function OpenStreetMap({ places, routeStops = [], selectedId, onSelect, l
         marker.addTo(map);
       });
 
-      if (routeStops.length > 0 && !(startPoint && destination)) {
+      if (routeStops.length > 0) {
         const terminals = new Map(routeStops.map((stop) => [stop.terminal.id, stop.terminal]));
         terminals.forEach((terminal) => {
           L.circleMarker([terminal.latitude, terminal.longitude], {
@@ -191,6 +309,7 @@ export function OpenStreetMap({ places, routeStops = [], selectedId, onSelect, l
           [stop.terminal.latitude, stop.terminal.longitude] as [number, number],
           [stop.latitude, stop.longitude] as [number, number],
         ]);
+        if (startPoint) boundsPoints.push([startPoint.latitude, startPoint.longitude]);
         map.fitBounds(L.latLngBounds(boundsPoints), { padding: [34, 34], maxZoom: 14 });
       }
 
@@ -198,29 +317,27 @@ export function OpenStreetMap({ places, routeStops = [], selectedId, onSelect, l
       requestAnimationFrame(() => map.invalidateSize());
     }
 
-    initializeMap();
+    void setupMap();
     return () => {
-      cancelled = true;
-      mapRef.current?.remove();
-      mapRef.current = null;
+      active = false;
+      if (mapRef.current) {
+        mapRef.current.remove();
+        mapRef.current = null;
+      }
     };
-  }, [destination, liveLocation, onMapPress, onSelect, places, routeGeometry, routeStops, startPoint]);
+  }, [places, routeStops, liveLocation, startPoint, destination, routeGeometry, onSelect, onMapPress, registeredBusinesses, showTransportRoutes, showRegisteredBusinesses]);
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map) return;
-    const selected = places.find((place) => place.id === selectedId);
-    map.flyTo(
-      selected ? [selected.latitude, selected.longitude] : [LEGAZPI.latitude, LEGAZPI.longitude],
-      selected ? 14 : 12,
-      { duration: 0.5 },
-    );
-  }, [places, selectedId]);
+    if (!map || !selectedId) return;
+    const target = routeStops.find((stop) => stop.id === selectedId) ?? places.find((place) => place.id === selectedId);
+    if (target) map.flyTo([target.latitude, target.longitude], 15, { duration: 0.8 });
+  }, [selectedId, places, routeStops]);
 
   return (
-    <div className="map-container">
-      <div ref={hostRef} style={{ position: "absolute", inset: 0 }} />
-      {onMapPress && <div className="map-tap-hint">Tap anywhere to route there</div>}
+    <div className="leaflet-map-container">
+      <div ref={hostRef} className="leaflet-map" aria-label="OpenStreetMap interactive map view" />
+      {onMapPress && <div className="map-tap-hint">Tap map to drop pin</div>}
     </div>
   );
 }

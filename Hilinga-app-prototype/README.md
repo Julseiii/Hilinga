@@ -54,3 +54,14 @@ Join our community of developers creating universal apps.
 
 - [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
 - [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+
+# AI itinerary generation
+
+The planner uses a conversational questionnaire, then calls a server-side Vercel Function to generate a structured itinerary. Add these environment variables to the Vercel project:
+
+```bash
+OPENAI_API_KEY=your_server_side_key
+OPENAI_ITINERARY_MODEL=gpt-5.6-luna
+```
+
+`OPENAI_ITINERARY_MODEL` is optional. Never prefix the API key with `VITE_`; doing so would expose it to the browser. When the endpoint or key is unavailable, the planner automatically uses its built-in local itinerary generator.
