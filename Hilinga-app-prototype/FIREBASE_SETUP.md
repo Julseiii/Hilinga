@@ -30,8 +30,11 @@ Then set it to `true` and restart the app. Profile setup still works while
 Storage is disabled; selected photos are session-only until cloud uploads are
 enabled.
 
-Profiles are stored at `profiles/{uid}`. Saved places and trip plans are stored
-under `users/{uid}/savedPlaces/{placeId}` and
+Profiles are stored at `profiles/{uid}`. Shared business posts are stored at
+`businessPosts/{postId}`, with their media under `business-posts/{uid}` in
+Cloud Storage. Any authenticated user can read those posts and media, while
+only the owning business account can create or delete them. Saved places and
+trip plans are stored under `users/{uid}/savedPlaces/{placeId}` and
 `users/{uid}/tripPlans/{planId}`. Firestore rules allow an authenticated user to
 read and write only their own documents and validate the fields written by the
 app. Avatars are stored below `avatars/{uid}` and are limited to authenticated

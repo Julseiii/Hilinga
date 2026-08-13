@@ -92,6 +92,54 @@ service cloud.firestore {
         && resource.data.authorUid == request.auth.uid;
     }
 
+    match /businessPosts/{postId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasAll([
+          'ownerUid', 'sourceId', 'businessId', 'businessName',
+          'businessCategory', 'businessLocation', 'businessLogoUrl',
+          'category', 'title', 'detail', 'mediaUrl', 'mediaType', 'createdAt'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'ownerUid', 'sourceId', 'businessId', 'businessName',
+          'businessCategory', 'businessLocation', 'businessLogoUrl',
+          'category', 'title', 'detail', 'mediaUrl', 'mediaType',
+          'eventDate', 'eventLocation', 'promotionOffer', 'promotionEnds',
+          'createdAt'
+        ])
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.businessId == 'registered-' + request.auth.uid
+        && request.resource.data.sourceId is string
+        && request.resource.data.sourceId.size() > 0
+        && request.resource.data.sourceId.size() <= 128
+        && request.resource.data.businessName is string
+        && request.resource.data.businessName.size() > 0
+        && request.resource.data.businessName.size() <= 120
+        && request.resource.data.businessCategory is string
+        && request.resource.data.businessCategory.size() > 0
+        && request.resource.data.businessCategory.size() <= 80
+        && request.resource.data.businessLocation is string
+        && request.resource.data.businessLocation.size() <= 160
+        && request.resource.data.businessLogoUrl is string
+        && request.resource.data.businessLogoUrl.size() <= 2000
+        && request.resource.data.category in [
+          'Photos & Videos', 'Events', 'Promotions'
+        ]
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 200
+        && request.resource.data.detail is string
+        && request.resource.data.detail.size() <= 1500
+        && request.resource.data.mediaUrl is string
+        && request.resource.data.mediaUrl.size() > 0
+        && request.resource.data.mediaUrl.size() <= 2000
+        && request.resource.data.mediaType in ['image', 'video']
+        && request.resource.data.createdAt is string;
+      allow update: if false;
+      allow delete: if request.auth != null
+        && resource.data.ownerUid == request.auth.uid;
+    }
+
     match /{document=**} {
       allow read, write: if false;
     }

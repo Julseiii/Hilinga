@@ -1,25 +1,17 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
 import { useAuth } from "@/providers/auth-provider";
-import { BUSINESS_CONTENT_CHANGED_EVENT } from "@/lib/business-content";
+import {
+  BUSINESS_CONTENT_CHANGED_EVENT,
+  migrateLocalBusinessPosts,
+  publishBusinessPost,
+  subscribeToOwnedBusinessPosts,
+  type BusinessPostCategory,
+  type StoredBusinessItem,
+} from "@/lib/business-content";
 
 type BusinessTab = "home" | "my-business" | "create" | "inbox" | "profile";
-type BusinessPostCategory = "Photos & Videos" | "Events" | "Promotions";
-type BusinessItem = {
-  id: string;
-  category?: BusinessPostCategory;
-  kind?: string;
-  title: string;
-  detail: string;
-  imageUrl?: string;
-  mediaUrl?: string;
-  mediaType?: "image" | "video";
-  eventDate?: string;
-  eventLocation?: string;
-  promotionOffer?: string;
-  promotionEnds?: string;
-  createdAt: string;
-};
+type BusinessItem = StoredBusinessItem;
 type BusinessPageInfo = {
   name: string;
   businessScale: "Small business" | "Big enterprise";
@@ -100,6 +92,7 @@ export function BusinessApp() {
   const [promotionOffer, setPromotionOffer] = useState("");
   const [promotionEnds, setPromotionEnds] = useState("");
   const [imageError, setImageError] = useState("");
+  const [publishing, setPublishing] = useState(false);
   const storageKey = `hilinga_business_items_v1:${user?.uid ?? "guest"}`;
   const pageStorageKey = `hilinga_business_page_v1:${user?.uid ?? "guest"}`;
   const [items, setItems] = useState<BusinessItem[]>(() => {
@@ -138,25 +131,86 @@ export function BusinessApp() {
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
+  useEffect(() => {
+    if (!user?.uid) return;
+    const legacyItems = (() => {
+      try { return JSON.parse(localStorage.getItem(storageKey) ?? "[]") as BusinessItem[]; }
+      catch { return []; }
+    })();
+    const storedPage = (() => {
+      try { return JSON.parse(localStorage.getItem(pageStorageKey) ?? "{}") as Partial<BusinessPageInfo>; }
+      catch { return {}; }
+    })();
+    const unsubscribe = subscribeToOwnedBusinessPosts(user.uid, (posts) => {
+      const cloudItems = posts.map((post) => ({
+        id: post.sourceId ?? post.id,
+        category: post.category,
+        title: post.title,
+        detail: post.detail,
+        mediaUrl: post.mediaUrl,
+        mediaType: post.mediaType,
+        eventDate: post.eventDate,
+        eventLocation: post.eventLocation,
+        promotionOffer: post.promotionOffer,
+        promotionEnds: post.promotionEnds,
+        createdAt: post.createdAt,
+      }));
+      const cloudIds = new Set(cloudItems.map((item) => item.id));
+      setItems([...cloudItems, ...legacyItems.filter((item) => !cloudIds.has(item.id))]
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+    }, (error) => console.warn("[business-posts] Could not load cloud posts:", error));
+
+    if (legacyItems.length > 0) {
+      void migrateLocalBusinessPosts(user.uid, { ...defaultPageInfo, ...storedPage }, legacyItems)
+        .catch((error) => console.warn("[business-posts] Could not migrate local posts:", error));
+    }
+    return unsubscribe;
+  }, [user?.uid]);
+
   function navigate(next: BusinessTab) {
     if (next === "create") { setCreateOpen(true); return; }
     setTab(next);
     window.history.pushState({ businessTab: next }, "", `#business/${next}`);
   }
 
-  function createItem(event: FormEvent) {
+  async function createItem(event: FormEvent) {
     event.preventDefault();
-    if (!title.trim() || !mediaUrl) return;
+    if (!user?.uid || !title.trim() || !mediaUrl || publishing) return;
     if (category === "Events" && (!eventDate || !eventLocation.trim())) { setImageError("Add the event date and location."); return; }
     if (category === "Promotions" && !promotionOffer.trim()) { setImageError("Add the promotion or offer details."); return; }
-    const next: BusinessItem[] = [{ id: crypto.randomUUID(), category, title: title.trim(), detail: detail.trim(), mediaUrl, mediaType, eventDate: category === "Events" ? eventDate : undefined, eventLocation: category === "Events" ? eventLocation.trim() : undefined, promotionOffer: category === "Promotions" ? promotionOffer.trim() : undefined, promotionEnds: category === "Promotions" ? promotionEnds : undefined, createdAt: new Date().toISOString() }, ...items];
+    const item: BusinessItem = { id: crypto.randomUUID(), category, title: title.trim(), detail: detail.trim(), mediaUrl, mediaType, eventDate: category === "Events" ? eventDate : undefined, eventLocation: category === "Events" ? eventLocation.trim() : undefined, promotionOffer: category === "Promotions" ? promotionOffer.trim() : undefined, promotionEnds: category === "Promotions" ? promotionEnds : undefined, createdAt: new Date().toISOString() };
+    setPublishing(true);
+    setImageError("");
     try {
+      const published = await publishBusinessPost({
+        ownerUid: user.uid,
+        sourceId: item.id,
+        businessName: pageInfo.name,
+        businessCategory: pageInfo.category,
+        businessLocation: pageInfo.location || "Legazpi City, Albay",
+        businessLogoUrl: pageInfo.logoUrl,
+        category,
+        title: item.title,
+        detail: item.detail,
+        mediaUrl,
+        mediaType,
+        eventDate: item.eventDate,
+        eventLocation: item.eventLocation,
+        promotionOffer: item.promotionOffer,
+        promotionEnds: item.promotionEnds,
+        createdAt: item.createdAt,
+      });
+      const savedItem = { ...item, mediaUrl: published.mediaUrl };
+      const next: BusinessItem[] = [savedItem, ...items.filter((existing) => existing.id !== savedItem.id)];
       localStorage.setItem(storageKey, JSON.stringify(next));
       setItems(next);
       window.dispatchEvent(new Event(BUSINESS_CONTENT_CHANGED_EVENT));
       setTitle(""); setDetail(""); setMediaUrl(""); setMediaType("image"); setEventDate(""); setEventLocation(""); setPromotionOffer(""); setPromotionEnds(""); setImageError(""); setCreateOpen(false); navigate("my-business");
-    } catch {
-      setImageError("Your device does not have enough local storage for this image. Choose a smaller image.");
+    } catch (error) {
+      console.error("[business-posts] Publish failed:", error);
+      setImageError("This post could not be shared. Check your connection and Firebase permissions, then try again.");
+    } finally {
+      setPublishing(false);
     }
   }
 

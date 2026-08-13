@@ -1,7 +1,24 @@
+import {
+  collection,
+  doc,
+  getDoc,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  setDoc,
+  where,
+} from "firebase/firestore";
+import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
+
+import { firestore, storage } from "@/lib/firebase";
+
 export type BusinessPostCategory = "Photos & Videos" | "Events" | "Promotions";
 
 export type BusinessPost = {
   id: string;
+  ownerUid?: string;
+  sourceId?: string;
   businessId: string;
   businessName: string;
   businessCategory: string;
@@ -17,6 +34,11 @@ export type BusinessPost = {
   promotionOffer?: string;
   promotionEnds?: string;
   createdAt: string;
+};
+
+export type PublishBusinessPostInput = Omit<BusinessPost, "id" | "businessId"> & {
+  ownerUid: string;
+  sourceId: string;
 };
 
 type StoredBusinessPage = {
@@ -40,7 +62,8 @@ export type RegisteredSmallBusiness = {
   longitude: number;
 };
 
-type StoredBusinessItem = Omit<BusinessPost, "businessId" | "businessName" | "businessCategory" | "businessLocation" | "businessLogoUrl" | "category" | "mediaUrl" | "mediaType"> & {
+export type StoredBusinessItem = Omit<BusinessPost, "id" | "ownerUid" | "sourceId" | "businessId" | "businessName" | "businessCategory" | "businessLocation" | "businessLogoUrl" | "category" | "mediaUrl" | "mediaType"> & {
+  id: string;
   category?: BusinessPostCategory;
   kind?: string;
   imageUrl?: string;
@@ -49,6 +72,8 @@ type StoredBusinessItem = Omit<BusinessPost, "businessId" | "businessName" | "bu
 };
 
 export const BUSINESS_CONTENT_CHANGED_EVENT = "hilinga:business-content-changed";
+
+const businessPostsCollection = collection(firestore, "businessPosts");
 
 const ALBAY_TOWN_COORDINATES: Array<{ patterns: RegExp[]; lat: number; lng: number }> = [
   { patterns: [/cagsawa/i, /daraga/i, /busay/i, /anislag/i], lat: 13.1417, lng: 123.7150 },
@@ -69,6 +94,120 @@ const ALBAY_TOWN_COORDINATES: Array<{ patterns: RegExp[]; lat: number; lng: numb
   { patterns: [/malinao/i], lat: 13.4090, lng: 123.6930 },
   { patterns: [/manito/i], lat: 13.1200, lng: 123.8700 },
 ];
+
+function cloudPostId(ownerUid: string, sourceId: string) {
+  return `${ownerUid}_${sourceId}`;
+}
+
+function postCategory(item: StoredBusinessItem): BusinessPostCategory {
+  return item.category ?? (item.kind === "Promotion" ? "Promotions" : item.kind === "Events" ? "Events" : "Photos & Videos");
+}
+
+function publicImageUrl(value: string) {
+  return value.startsWith("data:") ? "" : value;
+}
+
+function mediaExtension(contentType: string, mediaType: "image" | "video") {
+  const subtype = contentType.split("/")[1]?.split(";")[0]?.toLowerCase();
+  if (subtype && /^[a-z0-9]+$/.test(subtype)) return subtype.replace("jpeg", "jpg").replace("quicktime", "mov");
+  return mediaType === "video" ? "mp4" : "jpg";
+}
+
+async function uploadPostMedia(ownerUid: string, postId: string, mediaUrl: string, mediaType: "image" | "video") {
+  if (!mediaUrl.startsWith("data:")) return mediaUrl;
+  const response = await fetch(mediaUrl);
+  if (!response.ok) throw new Error("That post media could not be prepared for upload.");
+  const blob = await response.blob();
+  const mediaRef = ref(storage, `business-posts/${ownerUid}/${postId}.${mediaExtension(blob.type, mediaType)}`);
+  await uploadBytes(mediaRef, blob, { contentType: blob.type });
+  return getDownloadURL(mediaRef);
+}
+
+function toBusinessPost(id: string, value: Omit<BusinessPost, "id">): BusinessPost {
+  return { ...value, id };
+}
+
+export async function publishBusinessPost(input: PublishBusinessPostInput) {
+  const id = cloudPostId(input.ownerUid, input.sourceId);
+  const mediaUrl = await uploadPostMedia(input.ownerUid, id, input.mediaUrl, input.mediaType);
+  const post: Omit<BusinessPost, "id"> = {
+    ownerUid: input.ownerUid,
+    sourceId: input.sourceId,
+    businessId: `registered-${input.ownerUid}`,
+    businessName: input.businessName.trim(),
+    businessCategory: input.businessCategory.trim(),
+    businessLocation: input.businessLocation.trim(),
+    businessLogoUrl: publicImageUrl(input.businessLogoUrl),
+    category: input.category,
+    title: input.title.trim(),
+    detail: input.detail.trim(),
+    mediaUrl,
+    mediaType: input.mediaType,
+    createdAt: input.createdAt,
+    ...(input.eventDate ? { eventDate: input.eventDate } : {}),
+    ...(input.eventLocation ? { eventLocation: input.eventLocation.trim() } : {}),
+    ...(input.promotionOffer ? { promotionOffer: input.promotionOffer.trim() } : {}),
+    ...(input.promotionEnds ? { promotionEnds: input.promotionEnds } : {}),
+  };
+  await setDoc(doc(firestore, "businessPosts", id), post);
+  return toBusinessPost(id, post);
+}
+
+export function subscribeToPublishedBusinessPosts(
+  onPosts: (posts: BusinessPost[]) => void,
+  onError: (error: Error) => void,
+) {
+  const postsQuery = query(businessPostsCollection, orderBy("createdAt", "desc"), limit(100));
+  return onSnapshot(postsQuery, (snapshot) => {
+    onPosts(snapshot.docs.map((snapshotDoc) => toBusinessPost(
+      snapshotDoc.id,
+      snapshotDoc.data() as Omit<BusinessPost, "id">,
+    )));
+  }, onError);
+}
+
+export function subscribeToOwnedBusinessPosts(
+  ownerUid: string,
+  onPosts: (posts: BusinessPost[]) => void,
+  onError: (error: Error) => void,
+) {
+  const postsQuery = query(businessPostsCollection, where("ownerUid", "==", ownerUid));
+  return onSnapshot(postsQuery, (snapshot) => {
+    onPosts(snapshot.docs.map((snapshotDoc) => toBusinessPost(
+      snapshotDoc.id,
+      snapshotDoc.data() as Omit<BusinessPost, "id">,
+    )).sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+  }, onError);
+}
+
+export async function migrateLocalBusinessPosts(ownerUid: string, page: StoredBusinessPage, items: StoredBusinessItem[]) {
+  const results = await Promise.allSettled(items.map(async (item) => {
+    const mediaUrl = item.mediaUrl ?? item.imageUrl ?? "";
+    if (!mediaUrl) return;
+    const id = cloudPostId(ownerUid, item.id);
+    if ((await getDoc(doc(firestore, "businessPosts", id))).exists()) return;
+    await publishBusinessPost({
+      ownerUid,
+      sourceId: item.id,
+      businessName: page.name?.trim() || "Local business",
+      businessCategory: page.category?.trim() || "Local Business",
+      businessLocation: page.location?.trim() || "Legazpi City, Albay",
+      businessLogoUrl: page.logoUrl ?? "",
+      category: postCategory(item),
+      title: item.title,
+      detail: item.detail,
+      mediaUrl,
+      mediaType: item.mediaType ?? "image",
+      eventDate: item.eventDate,
+      eventLocation: item.eventLocation,
+      promotionOffer: item.promotionOffer,
+      promotionEnds: item.promotionEnds,
+      createdAt: item.createdAt,
+    });
+  }));
+  const failedCount = results.filter((result) => result.status === "rejected").length;
+  if (failedCount > 0) throw new Error(`${failedCount} local business post(s) could not be migrated.`);
+}
 
 export function getAddressCoordinates(address: string, ownerId: string): { latitude: number; longitude: number } {
   const match = ALBAY_TOWN_COORDINATES.find((item) => item.patterns.some((pattern) => pattern.test(address)));
@@ -138,12 +277,14 @@ export function readPublishedBusinessPosts() {
         posts.push({
           ...item,
           id: `${ownerId}:${item.id}`,
+          ownerUid: ownerId,
+          sourceId: item.id,
           businessId: `registered-${ownerId}`,
           businessName: page.name.trim(),
           businessCategory: page.category?.trim() || "Local Business",
           businessLocation: page.location?.trim() || "Legazpi City, Albay",
           businessLogoUrl: page.logoUrl ?? "",
-          category: item.category ?? (item.kind === "Promotion" ? "Promotions" : item.kind === "Events" ? "Events" : "Photos & Videos"),
+          category: postCategory(item),
           mediaUrl,
           mediaType: item.mediaType ?? "image",
         });

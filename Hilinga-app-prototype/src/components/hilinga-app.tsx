@@ -30,6 +30,7 @@ import {
   RegisteredSmallBusiness,
   readPublishedBusinessPosts,
   readRegisteredSmallBusinesses,
+  subscribeToPublishedBusinessPosts,
 } from "@/lib/business-content";
 import {
   CommunityPost,
@@ -1592,9 +1593,14 @@ function Feed({ onOpenBusiness }: { onOpenBusiness: (businessId: string) => void
 
   useEffect(() => {
     const refresh = () => setPublishedPosts(readPublishedBusinessPosts());
+    const unsubscribe = subscribeToPublishedBusinessPosts(
+      setPublishedPosts,
+      (error) => console.warn("[business-feed] Could not load shared posts:", error),
+    );
     window.addEventListener("storage", refresh);
     window.addEventListener(BUSINESS_CONTENT_CHANGED_EVENT, refresh);
     return () => {
+      unsubscribe();
       window.removeEventListener("storage", refresh);
       window.removeEventListener(BUSINESS_CONTENT_CHANGED_EVENT, refresh);
     };
